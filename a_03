@@ -1,0 +1,681 @@
+Dưới đây là **bản code đầy đủ (các file chính cần thay đổi/ thêm)** để triển khai hỗ trợ **MicroVideo** với cấu trúc bạn mô tả:
+
+```
+XMP/EXIF
+|
+Snapshot image (JPEG/HEIC)
+|
+MP4 container (appended) -> tracks: Media, Meta, raw audio, raw video
+```
+
+Mình sẽ cung cấp các file sửa/ thêm ở `src/main/java/com/android/motionphoto/utils/` và 2 file test ở `src/test/java/...`. Mình giả định dự án của bạn đã có các helper/ lớp như `MediaFile`, `SEFInfoImpl`, `XMPInfoImpl`, `ImageMetaReader/Writer`, `MotionPhotoInfo` interface, v.v. Nếu tên khác, bạn chỉnh import/đường dẫn nhỏ.
+
+---
+
+# 1) `XMPMicroVideo.kt` — hằng số XMP MicroVideo
+
+Tạo file mới.
+
+```kotlin
+// src/main/java/com/android/motionphoto/utils/XMPMicroVideo.kt
+package com.android.motionphoto.utils
+
+/**
+ * XMP keys for legacy MicroVideo (GCamera:MicroVideo).
+ * MicroVideo layout:
+ *  - XMP contains: MicroVideo=1, MicroVideoVersion, MicroVideoOffset (bytes from file start),
+ *    MicroVideoPresentationTimestampUs
+ */
+object XMPMicroVideo {
+    const val MICRO_VIDEO = "MicroVideo"
+    const val MICRO_VIDEO_VERSION = "MicroVideoVersion"
+    const val MICRO_VIDEO_OFFSET = "MicroVideoOffset"
+    const val MICRO_VIDEO_PRESENTATION_TIMESTAMP_US = "MicroVideoPresentationTimestampUs"
+}
+```
+
+---
+
+# 2) `MotionPhotoFormat.kt` — thêm enum `MICROVIDEO`
+
+Thêm member `MICROVIDEO` để semantic rõ ràng.
+
+```kotlin
+// src/main/java/com/android/motionphoto/utils/MotionPhotoFormat.kt
+package com.android.motionphoto.utils
+
+enum class MotionPhotoFormat(val code: Int, val version: String) {
+    NONE(0, ""),
+    V1(1, "1"),
+    V2(2, "2"),
+    V3(3, "3"),
+    MICROVIDEO(100, "microvideo"); // legacy MicroVideo XMP-only format
+
+    companion object {
+        fun of(code: Int): MotionPhotoFormat {
+            return values().find { it.code == code } ?: NONE
+        }
+        fun ofVersionString(v: String?): MotionPhotoFormat {
+            return when (v) {
+                "1" -> V1
+                "2" -> V2
+                "3" -> V3
+                "microvideo", "mv1" -> MICROVIDEO
+                else -> NONE
+            }
+        }
+    }
+}
+```
+
+---
+
+# 3) `MotionPhotoInfoImpl.kt` — detect & read MicroVideo; videoPosition/size/captureTimestamp/isValid
+
+File lớn — mình thay đổi/ thêm các phần cần thiết. Mã giữ nguyên các phần SEF hiện có và thêm MicroVideo fallback.
+
+```kotlin
+// src/main/java/com/android/motionphoto/utils/MotionPhotoInfoImpl.kt
+package com.android.motionphoto.utils
+
+import android.graphics.RectF
+import android.graphics.Bitmap
+import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.io.FileDescriptor
+import java.io.File
+import java.io.FileOutputStream
+
+class MotionPhotoInfoImpl internal constructor(internal val mediaFile: MediaFile): MotionPhotoInfo {
+    private val sefInfo: SEFInfo by lazy { SEFInfoImpl(mediaFile, ::parseExtraOfMotionPhotoFromSEF) }
+    private val exifIno: ExifInfo by lazy { ExifInfoImpl(mediaFile) }
+    private val xmpInfo: XMPInfo by lazy { XMPInfoImpl(mediaFile, exifIno.xmp) }
+
+    private val _videoInfo: VideoInfo by lazy {
+        // existing SEF-based video info (may be zero)
+        val (position, length) = sefInfo
+            .getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_DATA)?.toKotlinPair() ?: Pair(0L, 0)
+        VideoInfoImpl(mediaFile, position, length.toLong())
+    }
+
+    private val autoPlayVideoInfo: VideoInfo by lazy {
+        sefInfo.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_AUTOPLAY)?.let {
+            val (position, length) = it.toKotlinPair()
+            VideoInfoImpl(mediaFile, position, length.toLong())
+        } ?: object : VideoInfo {
+            override fun getMimeType() = MimeType.NONE
+            override fun numberOfTracks() = 0
+            override fun getTrackDurations() = emptyMap<MimeType, Long>()
+            override fun getSampleCount()= emptyMap<MimeType, Long>()
+            override fun getVideoFrameCount() = 0
+            override fun getVideoDurationMs() = 0L
+            override fun getWidth() = 0
+            override fun getHeight() = 0
+            override fun getRotation() = 0
+            override fun getBitrate() = 0
+            override fun getTrackFirstTimestampUs() = emptyMap<MimeType, Long>()
+            override fun getTrackLastTimestampUs() = emptyMap<MimeType, Long>()
+            override fun getThumbnailImage(): Bitmap { throw UnsupportedOperationException() }
+            override fun getFrameAt(timeUs: Long, option: Int): Bitmap { throw UnsupportedOperationException() }
+        }
+    }
+
+    private var sefMPVersion = MotionPhotoFormat.NONE
+
+    constructor(fd: FileDescriptor): this(MediaFile(fd))
+    constructor(file: File): this(MediaFile(file))
+
+    override fun getXMPInfo() = xmpInfo
+    override fun getSEFInfo() = sefInfo
+    override fun getExifInfo() = exifIno
+    override fun getVideoInfo() = _videoInfo
+
+    /**
+     * isValid: return true if video exists and recognized.
+     * Priority: SEF -> MicroVideo (XMP)
+     */
+    override fun isValid(): Boolean {
+        // 1) SEF-based detection
+        sefInfo.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_DATA)?.toKotlinPair()?.let { (position, _) ->
+            mediaFile.useInputFileChannel {
+                val isMP4 = it.position(position).let { _ -> MediaFile.isMP4Video(it) }
+                val isMOV = it.position(position).let { _ -> MediaFile.isMOVVideo(it) }
+                return isMP4 || isMOV
+            }
+        }
+
+        // 2) MicroVideo XMP
+        if (getXMPMotionPhotoVersion() == MotionPhotoFormat.MICROVIDEO) {
+            val offset = xmpInfo.getProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_OFFSET)?.toLongOrNull() ?: 0L
+            if (offset > 0L && offset < mediaFile.size()) {
+                mediaFile.useInputFileChannel {
+                    it.position(offset)
+                    return MediaFile.isMP4Video(it) || MediaFile.isMOVVideo(it)
+                }
+            }
+            return false
+        }
+
+        return false
+    }
+
+    override fun getSEFMotionPhotoVersion(): MotionPhotoFormat {
+        sefInfo.version // ensure parse
+        return sefMPVersion
+    }
+
+    override fun getXMPMotionPhotoVersion(): MotionPhotoFormat {
+        // If MicroVideo flag present -> MICROVIDEO
+        val microFlag = xmpInfo.getProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO)
+        if (microFlag?.toIntOrNull() == 1) return MotionPhotoFormat.MICROVIDEO
+
+        // Otherwise check standard MotionPhotoFormatVersion
+        return xmpInfo.getProperty(XMP_GOOGLE_CAMERA_NS, XMP_MOTION_PHOTO_FORMAT_VERSION)?.toInt()?.let {
+            MotionPhotoFormat.of(it)
+        } ?: MotionPhotoFormat.NONE
+    }
+
+    override fun getImageMimeType() = mediaFile.mimeType
+    override fun getImageWidth() = exifIno.width
+    override fun getImageHeight() = exifIno.height
+    override fun getImageRotation() = exifIno.rotation
+    override fun getFileSize() = mediaFile.size()
+    override fun getImageSize() = (sefInfo as SEFInfoImpl).getImageSize()
+    override fun getDateTimeTaken() = exifIno.dateTimeTaken
+
+    override fun getCaptureTimestampUs() = xmpInfo.getProperty(
+        XMP_GOOGLE_CAMERA_NS,
+        XMPMicroVideo.MICRO_VIDEO_PRESENTATION_TIMESTAMP_US
+    )?.toLong() ?: xmpInfo.getProperty(
+        XMP_GOOGLE_CAMERA_NS,
+        XMP_MOTION_PHOTO_CAPTURE_TIMESTAMP
+    )?.toLong() ?: 0L
+
+    override fun getVideoMimeType() = videoInfo.mimeType ?: MimeType.NONE
+    override fun getNumTracksOfVideo() = videoInfo.numberOfTracks()
+    override fun getTrackDurationsOfVideo() = videoInfo.getTrackDurations()
+    override fun getVideoBitrate() = videoInfo.bitrate
+    override fun getVideoDurationUs(): Long = videoInfo.videoDurationMs * 1000L
+
+    /**
+     * videoPosition: preference SEF. If SEF absent and MicroVideo present (XMP), return MicroVideoOffset.
+     */
+    override fun getVideoPosition(): Long {
+        sefInfo.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_DATA)?.toKotlinPair()?.let { (position, length) ->
+            return when {
+                length <= MOTION_PHOTO_MIN_VIDEO_SIZE -> sefInfo.getData(SEF_KEY_TYPE_MOTION_PHOTO_DATA)?.let {
+                    ByteArrayInputStream(it)
+                }?.use {
+                    it.readAsString(4)
+                    it.readAsIntBuffer(1).getLong()
+                } ?: 0L
+                else -> position
+            }
+        }
+
+        if (getXMPMotionPhotoVersion() == MotionPhotoFormat.MICROVIDEO) {
+            val offset = xmpInfo.getProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_OFFSET)?.toLongOrNull()
+            if (offset != null && offset > 0L) return offset
+        }
+        return 0L
+    }
+
+    /**
+     * videoSize: preference SEF. If MicroVideo present -> fileSize - offset
+     */
+    override fun getVideoSize(): Long {
+        sefInfo.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_DATA)?.toKotlinPair()?.let { (_, length) ->
+            return when {
+                length <= MOTION_PHOTO_MIN_VIDEO_SIZE -> sefInfo.getData(SEF_KEY_TYPE_MOTION_PHOTO_DATA)?.let {
+                    ByteArrayInputStream(it)
+                }?.use {
+                    it.readAsString(4)
+                    it.readAsIntBuffer(2).getLong(1)
+                } ?: 0L
+                else -> length.toLong()
+            }
+        }
+
+        if (getXMPMotionPhotoVersion() == MotionPhotoFormat.MICROVIDEO) {
+            val offset = xmpInfo.getProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_OFFSET)?.toLongOrNull()
+            val fs = mediaFile.size()
+            if (offset != null && offset > 0L && fs > offset) return fs - offset
+        }
+        return 0L
+    }
+
+    override fun getVideo(): ByteArray? {
+        // Return SEF data if exists, else extract from file using MicroVideo offset
+        sefInfo.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_DATA)?.toKotlinPair()?.let { (_, length) ->
+            return sefInfo.getData(SEF_KEY_TYPE_MOTION_PHOTO_DATA)
+        }
+
+        if (getXMPMotionPhotoVersion() == MotionPhotoFormat.MICROVIDEO) {
+            val offset = getVideoPosition()
+            val size = getVideoSize()
+            if (offset > 0 && size > 0) {
+                val out = ByteArray(size.toInt())
+                mediaFile.newInputFileStream().use { input ->
+                    input.channel.position(offset)
+                    input.readFully(out)
+                }
+                return out
+            }
+        }
+        return null
+    }
+
+    override fun getVideo(file: File): Long {
+        val (position, length) = sefInfo.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_DATA)?.toKotlinPair() ?: Pair(0L, 0)
+        if (length > 0) {
+            file.outputStream().use { output ->
+                mediaFile.newInputFileStream().use { input ->
+                    input.channel.transferAllTo(position, length.toLong(), output.channel)
+                }
+            }
+            return length.toLong()
+        }
+
+        if (getXMPMotionPhotoVersion() == MotionPhotoFormat.MICROVIDEO) {
+            val pos = getVideoPosition()
+            val size = getVideoSize()
+            if (pos > 0 && size > 0) {
+                file.outputStream().use { output ->
+                    mediaFile.newInputFileStream().use { input ->
+                        input.channel.transferAllTo(pos, size, output.channel)
+                    }
+                }
+                return size
+            }
+        }
+        return 0L
+    }
+
+    override fun getVideo(fileDescriptor: FileDescriptor): Long {
+        val (position, length) = sefInfo.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_DATA)?.toKotlinPair() ?: Pair(0L, 0)
+        if (length > 0) {
+            FileOutputStream(fileDescriptor).use { output ->
+                mediaFile.newInputFileStream().use { input ->
+                    input.channel.transferAllTo(position, length.toLong(), output.channel)
+                }
+            }
+            return length.toLong()
+        }
+
+        if (getXMPMotionPhotoVersion() == MotionPhotoFormat.MICROVIDEO) {
+            val pos = getVideoPosition()
+            val size = getVideoSize()
+            if (pos > 0 && size > 0) {
+                FileOutputStream(fileDescriptor).use { output ->
+                    mediaFile.newInputFileStream().use { input ->
+                        input.channel.transferAllTo(pos, size, output.channel)
+                    }
+                }
+                return size
+            }
+        }
+
+        return 0L
+    }
+
+    override fun getAutoPlayVideoBitrate() = autoPlayVideoInfo.bitrate
+    override fun getAutoPlayVideoPosition(): Long {
+        return sefInfo.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_AUTOPLAY)?.first ?: 0L
+    }
+    override fun getAutoPlayVideoSize(): Long {
+        return sefInfo.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_AUTOPLAY)?.second?.toLong() ?: 0L
+    }
+    override fun getExtraInfo(): String? {
+        return sefInfo.getData(SEF_KEY_NAME_MOTION_PHOTO_INFO)?.let { String(it) }
+    }
+    override fun getImageVideoPadding(): Long {
+        return when (imageMimeType) {
+            MimeType.IMAGE_JPEG -> videoPosition - imageSize
+            MimeType.IMAGE_HEIC -> 8 // MPVD header size
+            else -> 0
+        }
+    }
+
+    override fun getCropRect(): RectF? {
+        return SEFInfoImpl(mediaFile).getData(MediaDefs.Meta.SEF.SEF_KEY_TYPE_MOTION_PHOTO_INFO)?.let {
+            val json = JSONObject(String(it))
+            val cropRect = json.getJSONObject("crop-rect")
+            val left = cropRect.getInt("left")
+            val top = cropRect.getInt("top")
+            val right = cropRect.getInt("right")
+            val bottom = cropRect.getInt("bottom")
+            val origVideo = json.getJSONObject("video-info")
+            val origVideoWidth = origVideo.getInt("org-width")
+            val origVideoHeight = origVideo.getInt("org-height")
+            if ((right == 0 && bottom == 0) || origVideoWidth == 0 || origVideoHeight == 0) return null
+            if (left < 0 || top < 0 || right < 0 || bottom < 0) return null
+            if (left > right || top > bottom) return null
+            if (right > origVideoWidth || bottom > origVideoHeight) return null
+            val cropLeft = left.toFloat() / origVideoWidth
+            val cropTop = top.toFloat() / origVideoHeight
+            val cropRight = right.toFloat() / origVideoWidth
+            val cropBottom = bottom.toFloat() / origVideoHeight
+            return RectF(cropLeft, cropTop, cropRight, cropBottom)
+        }
+    }
+
+    private fun parseExtraOfMotionPhotoFromSEF(sefDataInfos: List<SEFDataInfo>) {
+        // existing parse logic remains unchanged...
+        sefDataInfos.firstOrNull { it.type == SEF_KEY_TYPE_MOTION_PHOTO_VERSION }?.run {
+            mediaFile.newInputFileStream().use {
+                it.channel.position(dataPosition)
+                sefMPVersion = MotionPhotoFormat.of(it.readAsString(4))
+            }
+        }
+
+        sefDataInfos.firstOrNull { it.type == SEF_KEY_TYPE_MOTION_PHOTO_DATA }?.run {
+            mediaFile.newInputFileStream().use {
+                it.channel.position(dataPosition)
+                val version = it.readAsString(4)
+                if (sefMPVersion == MotionPhotoFormat.NONE) {
+                    sefMPVersion = if (version == MotionPhotoFormat.V2.version) MotionPhotoFormat.V2 else MotionPhotoFormat.V1
+                }
+                if (mediaFile.mimeType == MimeType.IMAGE_HEIC && sefMPVersion != MotionPhotoFormat.V1) {
+                    dataPosition = it.readAsIntBuffer(1).get().toLong()
+                    dataPayload = it.readAsIntBuffer(1).get()
+                }
+            }
+        }
+    }
+
+    companion object {
+        private val TAG = SLog.tagOf(MotionPhotoInfoImpl::class.java)
+        private const val MOTION_PHOTO_MIN_VIDEO_SIZE = 1000000 shr 3
+    }
+}
+```
+
+> **Ghi chú**: phương thức `mediaFile.useInputFileChannel {}` và `MediaFile.isMP4Video(it)`/`isMOVVideo(it)` giả định đã có trong codebase; chúng dùng để read bytes và xác định container.
+
+---
+
+# 4) `MotionPhotoEditImpl.kt` — update `removeVideo()`, `removeAllData()`, `replaceVideo()`
+
+Cập nhật API cho thao tác viết/ loại bỏ video, hỗ trợ MicroVideo (XMP) và SEF (HEIC/MPVD). Mình giữ mạch commit hiện tại — bổ sung handling MicroVideo XMP.
+
+```kotlin
+// src/main/java/com/android/motionphoto/utils/MotionPhotoEditImpl.kt
+package com.android.motionphoto.utils
+
+import java.io.File
+import java.io.FileDescriptor
+import java.io.FileInputStream
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.file.StandardOpenOption
+
+class MotionPhotoEditImpl(
+    private val motionPhotoInfo: MotionPhotoInfo
+): MotionPhotoEdit, MotionPhotoInfo by motionPhotoInfo {
+    // ... existing fields and constructor remain
+
+    // removeVideo: format-aware removal
+    override fun removeVideo(): MotionPhotoEdit {
+        // 1) If SEF present -> remove SEF blocks and MPVD/MP data for heic/jpeg
+        if (sefMotionPhotoVersion != MotionPhotoFormat.NONE) {
+            // reuse existing logic to remove sef-data keys
+            if (imageMimeType == MimeType.IMAGE_HEIC) {
+                // schedule remove MPVD box on commit
+                extras[ExtraType.ADD_MPVD] = { removeMPVDBox(it) }
+            }
+            sefEdit.removeData(
+                SEF_KEY_NAME_MOTION_PHOTO_DATA,
+                SEF_KEY_NAME_MOTION_PHOTO_VERSION,
+                SEF_KEY_NAME_MOTION_PHOTO_INFO,
+                SEF_KEY_NAME_MOTION_PHOTO_AUTOPLAY,
+                SEF_KEY_NAME_LONG_EXPOSURE_EFFECT_INFO
+            )
+        }
+
+        // 2) Remove XMP MotionPhoto standard properties and items
+        xmpEdit
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_KEY_MOTION_PHOTO)
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_MOTION_PHOTO_FORMAT_VERSION)
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_MOTION_PHOTO_CAPTURE_TIMESTAMP)
+            .removeItem(XMP_KEY_MOTION_PHOTO)
+
+        // 3) If MicroVideo XMP present -> remove those props as well, and optionally truncate file
+        if (xmpInfo.getProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO)?.toIntOrNull() == 1) {
+            xmpEdit.removeProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO)
+            xmpEdit.removeProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_OFFSET)
+            xmpEdit.removeProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_PRESENTATION_TIMESTAMP_US)
+            xmpEdit.removeProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_VERSION)
+
+            // Truncate appended mp4 from file if we know offset and outputFile == inputFile (in-place)
+            val offset = xmpInfo.getProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_OFFSET)?.toLongOrNull() ?: 0L
+            if (offset > 0L) {
+                extras[ExtraType.ADD_MPVD] = { file ->
+                    // for JPEG, video usually appended after image bytes; truncate file at offset
+                    if (file.mimeType == MimeType.IMAGE_JPEG) {
+                        RandomAccessFile(file.file, "rw").use { raf ->
+                            raf.channel.truncate(offset)
+                        }
+                    } else if (file.mimeType == MimeType.IMAGE_HEIC) {
+                        // HEIC handled by MPVD removal logic
+                        removeMPVDBox(file)
+                    }
+                }
+            }
+        }
+
+        isMotionPhotoXMPRemoved = true
+        return this
+    }
+
+    // removeAllData: remove both SEF & XMP & MicroVideo
+    override fun removeAllData(): MotionPhotoEdit {
+        // remove SEF
+        if (imageMimeType == MimeType.IMAGE_HEIC) {
+            extras[ExtraType.ADD_MPVD] = { removeMPVDBox(it) }
+        }
+        sefEdit.removeData(
+            SEF_KEY_NAME_MOTION_PHOTO_DATA,
+            SEF_KEY_NAME_MOTION_PHOTO_VERSION,
+            SEF_KEY_NAME_MOTION_PHOTO_INFO,
+            SEF_KEY_NAME_MOTION_PHOTO_AUTOPLAY,
+            SEF_KEY_NAME_LONG_EXPOSURE_EFFECT_INFO
+        )
+        // remove xmp standard & microvideo
+        xmpEdit
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_KEY_MOTION_PHOTO)
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_MOTION_PHOTO_FORMAT_VERSION)
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_MOTION_PHOTO_CAPTURE_TIMESTAMP)
+            .removeItem(XMP_KEY_MOTION_PHOTO)
+
+        xmpEdit
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO)
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_OFFSET)
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_PRESENTATION_TIMESTAMP_US)
+            .removeProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_VERSION)
+
+        isMotionPhotoXMPRemoved = true
+        return this
+    }
+
+    // replaceVideo(file) supports SEF and MicroVideo cases:
+    override fun replaceVideo(videoFile: File): MotionPhotoEdit {
+        // 1) If target image is HEIC -> keep MPVD approach
+        if (outputFile.mimeType == MimeType.IMAGE_HEIC) {
+            // delegate to existing MPVD replace logic
+            addMPVDBox(outputFile, MediaFile(videoFile))
+            return this
+        }
+
+        // 2) For JPEG, if original is MICROVIDEO or no SEF -> write appended MP4 and update XMP
+        val videoBytes = videoFile.readBytes()
+        if (xmpInfo.getProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO)?.toIntOrNull() == 1 ||
+            sefMotionPhotoVersion == MotionPhotoFormat.NONE) {
+
+            // Append video at end of file (in-place if output==input)
+            val appendAction: (MediaFile) -> Pair<Int, Int> = { file ->
+                file.useOutputFileChannel { fc ->
+                    fc.position(file.size())
+                    // write raw bytes
+                    val pos = fc.position().toInt()
+                    fc.write(ByteBuffer.wrap(videoBytes))
+                    pos to videoBytes.size
+                }
+            }
+
+            extras[ExtraType.ADD_MPVD] = { file ->
+                // We will append raw mp4
+                addAppendVideo(file, videoBytes)
+            }
+
+            // update XMP microvideo props in xmpEdit
+            // offset = position where video starts (imageSize if known)
+            val offset: Long = fileSize // If we append at EOF, offset will be original file size
+            xmpEdit.setProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO, 1)
+            xmpEdit.setProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_VERSION, 1)
+            xmpEdit.setProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_OFFSET, offset)
+            xmpEdit.setProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_PRESENTATION_TIMESTAMP_US, getCaptureTimestampUs())
+            xmpEdit.setItem(XMP_KEY_MOTION_PHOTO, MimeType.VIDEO_MP4)
+            xmpEdit.setItemField(XMP_KEY_MOTION_PHOTO, XMP_KEY_LENGTH, videoBytes.size)
+            xmpEdit.setItemField(XMP_KEY_MOTION_PHOTO, XMP_KEY_PADDING, 0)
+            return this
+        }
+
+        // 3) Otherwise fallback to SEF path (existing)
+        // For SEF-present files we can put video into SEF data
+        sefEdit.putData(SEF_KEY_NAME_MOTION_PHOTO_DATA, MediaFile(videoFile))
+        return this
+    }
+
+    override fun replaceVideo(videoFd: FileDescriptor): MotionPhotoEdit {
+        val bytes = FileInputStream(videoFd).use { it.readAllBytes() }
+        // write via temporary file and call replaceVideo(File)
+        val tmp = File.createTempFile("mp_replace_", ".mp4")
+        tmp.outputStream().use { it.write(bytes) }
+        return replaceVideo(tmp)
+    }
+
+    // helper to append raw mp4 bytes at EOF (for JPEG)
+    private fun addAppendVideo(file: MediaFile, video: ByteArray) {
+        file.useOutputFileChannel { ofc ->
+            ofc.position(file.size())
+            ofc.write(ByteBuffer.wrap(video))
+            // if we need to write any box header: not necessary for raw MP4 stream appended
+        }
+    }
+
+    // ... rest of class (commit workflow, addMPVDBox, removeMPVDBox...) remains largely same, we re-used them earlier.
+}
+```
+
+> **Ghi chú quan trọng**:
+>
+> * `replaceVideo` for JPEG/MicroVideo: mình appends raw MP4 bytes and updates XMP MicroVideoOffset to original file size. Trong một số trường hợp cần chèn header/box (ví dụ mpvd box for HEIC) — mình giữ HEIC path unchanged (MPVD logic).
+> * Việc append raw mp4 bytes assumes MP4 is complete container and playable when placed at offset. Thực tế Google MicroVideo lưu MP4 appended; code kiểm tra container header khi đọc (`MediaFile.isMP4Video()`).
+
+---
+
+# 5) Unit tests (minimal) — `MotionPhotoInfoTest.kt` và `XMPInfoTest.kt`
+
+Bạn cần thêm sample `mp_micro.jpg` (JPEG snapshot + XMP MicroVideo props + appended MP4). Nếu không có sample, tests sẽ skip.
+
+## `XMPInfoTest.kt` (microvideo test)
+
+```kotlin
+// src/test/java/com/android/motionphoto/utils/XMPInfoTest.kt
+package com.android.motionphoto.utils
+
+import org.junit.Assert.*
+import org.junit.Test
+import java.io.File
+
+class XMPInfoTest {
+    @Test
+    fun testMicroVideoXMPIfResourceExists() {
+        val res = javaClass.getResource("mp_micro.jpg") ?: run {
+            println("mp_micro.jpg not provided - skipping microvideo XMP test")
+            return
+        }
+        val file = File(res.toURI())
+        val xmp = XMPInfo.parse(file)
+        val flag = xmp.getProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO)
+        assertNotNull(flag)
+        assertEquals("1", flag)
+        val offsetStr = xmp.getProperty(XMP_GOOGLE_CAMERA_NS, XMPMicroVideo.MICRO_VIDEO_OFFSET)
+        assertNotNull(offsetStr)
+        assertTrue(offsetStr!!.toLongOrNull() != null)
+    }
+}
+```
+
+## `MotionPhotoInfoTest.kt` (microvideo detection + operations)
+
+```kotlin
+// src/test/java/com/android/motionphoto/utils/MotionPhotoInfoTest.kt
+package com.android.motionphoto.utils
+
+import org.junit.Assert.*
+import org.junit.Test
+import java.io.File
+
+class MotionPhotoInfoTest {
+    @Test
+    fun testMicroVideoFlowIfResourceExists() {
+        val res = javaClass.getResource("mp_micro.jpg") ?: run {
+            println("mp_micro.jpg not provided - skipping microvideo flow test")
+            return
+        }
+        val file = File(res.toURI())
+        val mpInfo = MotionPhotoInfo.parse(file)
+        assertEquals(MotionPhotoFormat.MICROVIDEO, mpInfo.xmpMotionPhotoVersion)
+        assertTrue(mpInfo.isValid)
+        val offset = mpInfo.videoPosition
+        val size = mpInfo.videoSize
+        assertTrue(offset > 0)
+        assertTrue(size > 0)
+        assertEquals(file.length() - offset, size)
+    }
+}
+```
+
+---
+
+# 6) Lưu ý triển khai, testing & edge-cases
+
+1. **Bạn cần test với sample thật** (`mp_micro.jpg`) — gồm:
+
+   * XMP chứa `GCamera:MicroVideo="1"`, `MicroVideoOffset=<N>`, optional `MicroVideoVersion="1"`, `MicroVideoPresentationTimestampUs`.
+   * Raw MP4 container appended at offset `<N>` (mp4 container must be valid).
+2. **Xác thực container** dùng `MediaFile.isMP4Video(channel)` như code hiện tại — đảm bảo helper này đọc `ftyp`/`moov` boxes đúng.
+3. **Replace Video**:
+
+   * For MicroVideo we append full mp4 bytes and update XMP offset to previous EOF.
+   * If you require in-place overwrite (i.e., when file already contains appended mp4), consider truncating old mp4 then append new, or writing to temp file and rename (safer).
+4. **removeVideo**:
+
+   * For MicroVideo we remove XMP flags and optionally truncate to `offset`.
+   * If file is copy-on-write (outputFile != inputFile), you must apply truncate on output copy.
+   * For HEIC and SEF path we keep MPVD removal logic.
+5. **Concurrency / Atomicity**:
+
+   * Use temporary file + atomic rename if worried about crash during write.
+   * Current code uses channel transfer; recommended to copy to temp and then replace for safety.
+6. **Backwards compatibility**: SEF path untouched and remains preferred. MicroVideo handled only when SEF absent or MicroVideo XMP present.
+
+---
+
+# 7) Quick checklist before merging
+
+* [ ] Add `mp_micro.jpg` test resource (real sample).
+* [ ] Run `./gradlew test` — fix any missing imports or utility methods (e.g., `readFully`, `useInputFileChannel` helpers).
+* [ ] Review commit/atomic-write logic; consider temp file + rename for production reliability.
+* [ ] Update docs / CHANGELOG noting MicroVideo support and API changes (`removeVideo`, `replaceVideo`, `removeAllData` behavior).
+
+---
+
+Nếu bạn muốn, mình có thể tiếp tục và:
+
+* Sinh **full `.patch`** file chuẩn git (diff) để bạn `git apply`.
+* Chuyển `replaceVideo` để dùng **truncation** + append (safer) hoặc **temp-file** approach.
+* Viết thêm code helper nhỏ để đảm bảo atomic commit (temp file + rename).
+  Bạn muốn mình tạo full `.patch` ready-to-apply hay tiếp tục cải tiến một trong các điểm trên?
