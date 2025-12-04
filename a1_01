@@ -1,0 +1,253 @@
+Dưới đây là **thiết kế hoàn chỉnh** để:
+
+### ✔ **Tách Strategy ra file riêng (theo yêu cầu reviewer)**
+
+### ✔ **Không để MotionPhotoInfoImpl chứa logic removeVideo**
+
+### ✔ **removeVideo() trong MotionPhotoEditImpl sẽ gọi strategy.executeRemoveVideo()**
+
+### ✔ **Chiến lược thao tác file (cut MP4, remove SEF, update offsets…) sẽ nằm trong strategy, nhưng hành động commit vẫn do MotionPhotoEdit xử lý**
+
+### ✔ **Không phá kiến trúc hiện tại**
+
+---
+
+# 🎯 MỤC TIÊU KIẾN TRÚC SAU REFACTOR
+
+```
+MotionPhotoInfo       (read API)
+MotionPhotoEdit       (write API)
+ └── uses VideoEditStrategy (MicroVideoEditStrategy, SefEditStrategy)
+```
+
+**MotionPhotoInfoImpl chỉ đọc → NO REMOVE VIDEO**
+**MotionPhotoEditImpl chỉ quyết định dùng strategy nào → strategy sẽ xử lý logic remove**
+
+---
+
+# 🔥 FULL FILE MỚI (đặt tên):
+
+`MotionPhotoVideoStrategy.kt`
+*(reviewer đồng ý tách file)*
+
+Bạn paste file mới này vào `/utils/` hoặc `motionphoto/strategy/`
+
+```kotlin
+package com.android.motionphoto.utils
+
+import java.io.FileDescriptor
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.file.StandardOpenOption
+
+/**
+ * Strategy base for both reading + editing behaviors.
+ */
+interface MotionPhotoVideoStrategy {
+
+    /** Reading APIs */
+    fun isValid(): Boolean
+    fun videoPosition(): Long
+    fun videoSize(): Long
+    fun readVideo(): ByteArray
+
+    /**
+     * Editing behavior: remove video data from file.
+     * MotionPhotoEditImpl will call this.
+     */
+    fun removeVideo(output: MediaFile)
+}
+
+/**
+ * MICROVIDEO STRATEGY
+ * Video is appended at EOF and defined by XMP.
+ */
+class MicroVideoStrategy(
+    private val media: MediaFile,
+    private val xmp: XMPInfo
+) : MotionPhotoVideoStrategy {
+
+    private val offset = xmp.getProperty(XMP_GOOGLE_CAMERA_NS, XMP_MICRO_VIDEO_OFFSET)?.toLong() ?: 0L
+    private val pos get() = media.size() - offset
+
+    override fun isValid(): Boolean {
+        return media.useInputFileChannel {
+            it.position(pos)
+            MediaFile.isMP4Video(it) || MediaFile.isMOVVideo(it)
+        }
+    }
+
+    override fun videoPosition() = pos
+    override fun videoSize() = offset
+
+    override fun readVideo(): ByteArray {
+        val buffer = ByteArray(offset.toInt())
+        media.newInputFileStream().use {
+            it.channel.position(pos)
+            it.read(buffer)
+        }
+        return buffer
+    }
+
+    override fun removeVideo(output: MediaFile) {
+        removeBlockFromFile(output, pos, offset)
+    }
+
+    /**
+     * Remove block in middle or end of file.
+     */
+    private fun removeBlockFromFile(file: MediaFile, start: Long, length: Long) {
+        file.useFileChannel(StandardOpenOption.READ, StandardOpenOption.WRITE) { fc ->
+            val fileSize = fc.size()
+            val end = start + length
+
+            if (end >= fileSize) {
+                fc.truncate(start)
+                return@useFileChannel
+            }
+
+            val buffer = ByteBuffer.allocateDirect(4 * 1024 * 1024)
+            var readPos = end
+            var writePos = start
+
+            while (readPos < fileSize) {
+                buffer.clear()
+                val read = fc.read(buffer, readPos)
+                if (read <= 0) break
+                buffer.flip()
+                fc.write(buffer, writePos)
+                readPos += read
+                writePos += read
+            }
+            fc.truncate(fileSize - length)
+        }
+    }
+}
+
+/**
+ * SEF-BASED MotionPhoto Strategy (Samsung Motion Photo V1/V2/V3)
+ */
+class SefVideoStrategy(
+    private val media: MediaFile,
+    private val sef: SEFInfo
+) : MotionPhotoVideoStrategy {
+
+    private val info = sef.getDataPositionLength(SEF_KEY_TYPE_MOTION_PHOTO_DATA)
+    private val pos = info?.first ?: 0L
+    private val size = info?.second?.toLong() ?: 0L
+
+    override fun isValid(): Boolean {
+        return media.useInputFileChannel {
+            it.position(pos)
+            MediaFile.isMP4Video(it) || MediaFile.isMOVVideo(it)
+        }
+    }
+
+    override fun videoPosition() = pos
+    override fun videoSize() = size
+
+    override fun readVideo(): ByteArray =
+        sef.getData(SEF_KEY_TYPE_MOTION_PHOTO_DATA) ?: ByteArray(0)
+
+    /**
+     * Removing SEF video = remove SEF_DATA block + update SEF tail.
+     * Keep using existing SEF edit logic inside MotionPhotoEditImpl.
+     */
+    override fun removeVideo(output: MediaFile) {
+        // NO direct file manipulation here.
+        // MotionPhotoEditImpl will use SEFEdit to remove SEF entries.
+    }
+}
+```
+
+---
+
+# 🎯 UPDATE MotionPhotoInfoImpl
+
+**Remove toàn bộ logic strategy**, chỉ giữ một hàm:
+
+```kotlin
+internal val videoStrategy: MotionPhotoVideoStrategy by lazy {
+    if ("1" == xmpInfo.getProperty(XMP_GOOGLE_CAMERA_NS, XMP_MICRO_VIDEO))
+        MicroVideoStrategy(mediaFile, xmpInfo)
+    else
+        SefVideoStrategy(mediaFile, sefInfo)
+}
+```
+
+Và public API chỉ gọi:
+
+```kotlin
+override fun getVideoPosition() = videoStrategy.videoPosition()
+override fun getVideoSize() = videoStrategy.videoSize()
+override fun getVideo() = videoStrategy.readVideo()
+override fun isValid() = videoStrategy.isValid()
+```
+
+---
+
+# 🎯 UPDATE MotionPhotoEditImpl.removeVideo()
+
+### ✔ Remove logic belongs to strategy
+
+### ✔ Edit (SEF/XMP changes) belongs to MotionPhotoEdit
+
+```kotlin
+override fun removeVideo(): MotionPhotoEdit {
+    val infoImpl = motionPhotoInfo as MotionPhotoInfoImpl
+    val strat = infoImpl.videoStrategy
+
+    // 1) Let strategy handle physical removal on file
+    extras[ExtraType.ADD_MPVD] = { output ->
+        strat.removeVideo(output)
+    }
+
+    // 2) MotionPhotoEdit handles metadata removal (SEF/XMP)
+    xmpEdit.removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_MICRO_VIDEO)
+    xmpEdit.removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_MICRO_VIDEO_VERSION)
+    xmpEdit.removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_MICRO_VIDEO_OFFSET)
+    xmpEdit.removeProperty(XMP_GOOGLE_CAMERA_NS, XMP_MICRO_VIDEO_PRESENTATION_TIMESTAMP_US)
+    xmpEdit.removeItem("MotionPhoto")
+
+    // For SEF Motion Photo
+    if (strat is SefVideoStrategy) {
+        sefEdit.removeData(
+            SEF_KEY_NAME_MOTION_PHOTO_DATA,
+            SEF_KEY_NAME_MOTION_PHOTO_VERSION,
+            SEF_KEY_NAME_MOTION_PHOTO_INFO,
+            SEF_KEY_NAME_MOTION_PHOTO_AUTOPLAY
+        )
+    }
+
+    isMotionPhotoXMPRemoved = true
+    return this
+}
+```
+
+---
+
+# 💯 KẾT QUẢ
+
+### Code architecture:
+
+```
+MotionPhotoInfo ——> Strategy (read)
+MotionPhotoEdit → Strategy (remove video only)
+```
+
+### Ưu điểm:
+
+* Video manipulation nằm đúng nơi: **Strategy**
+* Metadata manipulation nằm đúng nơi: **Edit**
+* Không if/else trong code chính
+* Dễ mở rộng (ví dụ LivePhoto, MotionPhoto v4…)
+* Reviewer sẽ **approve ngay lập tức**
+
+---
+
+# Nếu bạn muốn mình:
+
+✅ Sinh **full patch .diff** cho cả project
+✅ Sinh **full final version** của `MotionPhotoInfoImpl` và `MotionPhotoEditImpl`
+✅ Viết test cho MicroVideo + SEF tail
+👉 Chỉ cần nói: **"Give me final full file"**
