@@ -1,0 +1,433 @@
+Dưới đây là **patch đầy đủ** (mã Kotlin) — thực hiện theo yêu cầu: dùng `TransitionRenderer` / `SlideShader` (render bằng EGL vào input-surface của encoder), tạo encoded transition frames (H.264) theo `TransitionConfig`, rồi chèn transition **như các `VideoTransferringTask`** vào danh sách `mergeTasks` để `VideoTransfer.writeTrack(...)` có thể ghi chúng giống như các sample video bình thường.
+
+Patch gồm 3 phần chính:
+
+1. `TransitionGenerator.kt` — helper tạo encoded transition samples (EGL + encoder + shader render + drain encoder).
+2. `TransitionTransferringTask.kt` — subclass nhẹ của `VideoTransferringTask` để chứa sẵn `samples` (video samples đã encode).
+3. Sửa `MotionScrap.prepareTasks(...)` — sau khi tạo `mergeTasks` ban đầu, tự động tạo transition giữa mỗi cặp tiếp giáp (nếu muốn) và interleave chúng vào `mergeTasks` trước khi trả về `format`.
+
+> Lưu ý quan trọng trước khi áp patch:
+>
+> * Patch giả sử project đã có `VideoTransferringTask` class, `MimeType.VIDEO_H264` (hoặc `MimeType.VIDEO_MP4` / string `"video/avc"`) và phương thức `VideoTransfer.writeTrack` hiện hỗ trợ nhận `samples` map (nó có: `writeTrack(source: MPFile, samples: Map<String, List<Pair<ByteBuffer, MediaCodec.BufferInfo>>>)`).
+> * Patch tạo transition samples với PTS **bắt đầu từ 0** (relative). `VideoTransfer` trong code gốc sẽ cộng `lastTransferredTimestampUs` khi ghi (cơ chế hiện có) — nên timestamp sẽ nối tiếp đúng.
+> * Nếu dự án dùng codec names / MimeType enum khác, thay đổi chuỗi `"video/avc"` phù hợp.
+
+---
+
+## Patch 1 — file mới: `TransitionGenerator.kt`
+
+```diff
++++ b/src/main/java/com/example/livephotoconvert/TransitionGenerator.kt
++package com.example.livephotoconvert
++
++import android.graphics.Bitmap
++import android.media.MediaCodec
++import android.media.MediaCodecInfo
++import android.media.MediaFormat
++import android.opengl.EGL14
++import android.opengl.EGLExt
++import android.opengl.GLES20
++import android.opengl.GLUtils
++import android.util.Log
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++
++object TransitionGenerator {
++    private const val TAG = "TransitionGenerator"
++
++    // Drain encoder output into list of sample buffers (copying data)
++    private fun drainEncoderToSamples(encoder: MediaCodec): MutableList<Pair<ByteBuffer, MediaCodec.BufferInfo>> {
++        val samples = mutableListOf<Pair<ByteBuffer, MediaCodec.BufferInfo>>()
++        val info = MediaCodec.BufferInfo()
++        while (true) {
++            val idx = encoder.dequeueOutputBuffer(info, 10_000)
++            if (idx >= 0) {
++                val outBuf = encoder.getOutputBuffer(idx)!!
++                val copy = ByteBuffer.allocateDirect(info.size)
++                outBuf.position(info.offset)
++                outBuf.limit(info.offset + info.size)
++                copy.put(outBuf)
++                copy.rewind()
++                val ci = MediaCodec.BufferInfo().apply {
++                    set(info.offset, info.size, info.presentationTimeUs, info.flags)
++                }
++                samples += copy to ci
++                encoder.releaseOutputBuffer(idx, false)
++                if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
++            } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
++                Log.d(TAG, "encoder output format changed: ${encoder.outputFormat}")
++            } else if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) {
++                // yield a little
++                Thread.yield()
++            }
++        }
++        return samples
++    }
++
++    /**
++     * Create encoded transition frames from two bitmaps using SlideShader-like logic.
++     *
++     * - encoderFormat must have correct KEY_WIDTH/KEY_HEIGHT and KEY_FRAME_RATE, KEY_BIT_RATE set.
++     * - returned samples have presentationTimeUs starting at 0, increasing by frameDurationUs.
++     */
++    fun createEncodedTransitionSamples(
++        bmpA: Bitmap,
++        bmpB: Bitmap,
++        cfg: TransitionConfig,
++        encoderFormat: MediaFormat,
++        slideType: Int = 0
++    ): List<Pair<ByteBuffer, MediaCodec.BufferInfo>> {
++        val mime = encoderFormat.getString(MediaFormat.KEY_MIME) ?: "video/avc"
++
++        // Configure encoder
++        val encoder = MediaCodec.createEncoderByType(mime)
++        encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
++        val inputSurface = encoder.createInputSurface()
++        encoder.start()
++
++        // Setup EGL on encoder input surface
++        val eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
++        val ver = IntArray(2)
++        EGL14.eglInitialize(eglDisplay, ver, 0, ver, 1)
++        val attrib = intArrayOf(
++            EGL14.EGL_RED_SIZE, 8,
++            EGL14.EGL_GREEN_SIZE, 8,
++            EGL14.EGL_BLUE_SIZE, 8,
++            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
++            EGL14.EGL_NONE
++        )
++        val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
++        val num = IntArray(1)
++        EGL14.eglChooseConfig(eglDisplay, attrib, 0, configs, 0, 1, num, 0)
++        val cfgEgl = configs[0]!!
++        val ctxAttr = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
++        val eglContext = EGL14.eglCreateContext(eglDisplay, cfgEgl, EGL14.EGL_NO_CONTEXT, ctxAttr, 0)
++        val eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, cfgEgl, inputSurface, intArrayOf(EGL14.EGL_NONE), 0)
++        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
++
++        // ensure shader compiled (uses SlideShader object from project/test utilities)
++        try {
++            SlideShader.ensureCompiled()
++        } catch (t: Throwable) {
++            Log.w(TAG, "SlideShader.ensureCompiled() failed: $t")
++        }
++
++        val steps = maxOf(1, ((cfg.durationMs / 1000.0) * cfg.fps).toInt())
++        val frameDurUs = 1_000_000L / cfg.fps
++
++        // Load textures
++        fun loadTex(bmp: Bitmap): Int {
++            val ids = IntArray(1)
++            GLES20.glGenTextures(1, ids, 0)
++            val tex = ids[0]
++            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
++            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
++            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
++            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
++            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
++            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
++            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
++            return tex
++        }
++
++        val w = encoderFormat.getInteger(MediaFormat.KEY_WIDTH)
++        val h = encoderFormat.getInteger(MediaFormat.KEY_HEIGHT)
++        val texA = loadTex(bmpA)
++        val texB = loadTex(bmpB)
++
++        for (i in 0 until steps) {
++            val weight = i.toFloat() / (steps - 1).coerceAtLeast(1)
++            GLES20.glViewport(0, 0, w, h)
++            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
++
++            // draw using project's SlideShader (signature: draw(texA, texB, weight, initAlpha, targetAlpha, delay, slideType, left, right, top, bottom))
++            SlideShader.draw(
++                texA, texB, weight, cfg.initAlpha, cfg.targetAlpha, cfg.delayFraction,
++                slideType, 0f, 1f, 1f, 0f
++            )
++
++            val ptsUs = i * frameDurUs // relative PTS starting at 0 for transition
++            EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, ptsUs * 1000L) // ns
++            EGL14.eglSwapBuffers(eglDisplay, eglSurface)
++        }
++
++        // signal EOS to encoder by calling signalEndOfInputStream (we already rendered all frames)
++        try {
++            encoder.signalEndOfInputStream()
++        } catch (_: Throwable) { /* some codecs may ignore */ }
++
++        // drain encoder output to sample list
++        val samples = drainEncoderToSamples(encoder)
++
++        // cleanup GL resources
++        GLES20.glDeleteTextures(2, intArrayOf(texA, texB), 0)
++        try {
++            EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
++            EGL14.eglDestroySurface(eglDisplay, eglSurface)
++            EGL14.eglDestroyContext(eglDisplay, eglContext)
++            EGL14.eglTerminate(eglDisplay)
++        } catch (_: Throwable) {}
++
++        try { encoder.stop(); encoder.release() } catch (_: Throwable) {}
++
++        return samples
++    }
++}
+```
+
+---
+
+## Patch 2 — file mới: `TransitionTransferringTask.kt`
+
+```diff
++++ b/src/main/java/com/example/livephotoconvert/TransitionTransferringTask.kt
++package com.example.livephotoconvert
++
++import java.nio.ByteBuffer
++import android.media.MediaCodec
++
++/**
++ * Lightweight task wrapper to represent a transition (already-encoded samples).
++ * It reuses VideoTransferringTask as a base so MotionScrap's queue accepts it.
++ *
++ * Use: create TransitionTransferringTask(id, mpFile, samplesMap)
++ */
++class TransitionTransferringTask(
++    id: Int,
++    mpFile: MPFile,
++    private val samplesMap: Map<String, List<Pair<ByteBuffer, MediaCodec.BufferInfo>>>
++) : VideoTransferringTask(id, mpFile) {
++
++    override fun isFromTranscoding(): Boolean = true
++
++    override fun getAllTranscodedSamples(): Map<String, List<Pair<ByteBuffer, MediaCodec.BufferInfo>>> {
++        return samplesMap
++    }
++}
+```
+
+> Nếu `VideoTransferringTask` không expose `getAllTranscodedSamples()` as `open`, bạn có thể thay đổi để thêm phương thức tương ứng; patch giả định phương thức có thể override (nếu không, có thể thay bằng trường dữ liệu và check `task is TransitionTransferringTask` trong merge thread).
+
+---
+
+## Patch 3 — sửa `MotionScrap.prepareTasks(...)`
+
+Chúng ta sẽ chèn bước *tạo transition* sau khi chia `mergeTasks` và `transcodingTasks` trong `prepareTasks(...)`. Dưới đây là phần code sửa (chỉ phần liên quan) — bạn hãy thay thế toàn bộ body của phương thức hiện tại bằng bản đã sửa (mình ghi khối lớn để bạn có thể dán):
+
+```diff
+*** Begin Patch for MotionScrap.prepareTasks(...) ***
+@@
+-        val (mergeTasks, transcodingTasks) = mpFiles.onEach {
+-            parseVideoInfo(it)
+-        }.also {
+-            var files = it
+-            if (!files.all { it.getAudioCodecType() == MimeType.NONE }) {
+-                files = files.filter { it.getAudioCodecType() != MimeType.NONE }
+-            }
+-
+-            frequentTranscodingVO = files.sortedByDescending {
+-                // if # of hevc & avc are same, set hevc as target
+-                it.getVideoCodecType().ordinal
+-            }.findMostFrequentOrNull({ TranscodingVO(it) }) {
+-                it.forEach { SLog.d(TAG, "frequent properties: k=${it.key}, size=${it.value.size}") }
+-            } ?: TranscodingVO()
+-
+-            if (frequentTranscodingVO.audioCodec == MimeType.AUDIO_RAW) {
+-                val refAudioFile = files.first()
+-                frequentTranscodingVO = frequentTranscodingVO.copy(
+-                    audioCodec = MimeType.AUDIO_AAC,
+-                    audioCodecFormat = createAACAudioFormat(refAudioFile)
+-                )
+-                SLog.i(TAG, "force target audio raw to aac")
+-            }
+-            SLog.i(TAG, "frequent TranscodingVO=$frequentTranscodingVO")
+-
+-            totalProgressTracker = ProgressTracker(progressUnit, it)
+-        }.mapIndexed { index, it ->
+-            when {
+-                frequentTranscodingVO.equals(it) -> VideoTransferringTask(index, it)
+-                else -> VideoTranscodingTask(index, it)
+-            }.also {
+-                SLog.d(TAG, "$index-th task is $it, path=${it.mpFile.path()}")
+-            }
+-        }.partition {
+-            it is VideoTransferringTask
+-        }
++        val (mergeTasks, transcodingTasks) = mpFiles.onEach {
++            parseVideoInfo(it)
++        }.also {
++            var files = it
++            if (!files.all { it.getAudioCodecType() == MimeType.NONE }) {
++                files = files.filter { it.getAudioCodecType() != MimeType.NONE }
++            }
++
++            frequentTranscodingVO = files.sortedByDescending {
++                // if # of hevc & avc are same, set hevc as target
++                it.getVideoCodecType().ordinal
++            }.findMostFrequentOrNull({ TranscodingVO(it) }) {
++                it.forEach { SLog.d(TAG, "frequent properties: k=${it.key}, size=${it.value.size}") }
++            } ?: TranscodingVO()
++
++            if (frequentTranscodingVO.audioCodec == MimeType.AUDIO_RAW) {
++                val refAudioFile = files.first()
++                frequentTranscodingVO = frequentTranscodingVO.copy(
++                    audioCodec = MimeType.AUDIO_AAC,
++                    audioCodecFormat = createAACAudioFormat(refAudioFile)
++                )
++                SLog.i(TAG, "force target audio raw to aac")
++            }
++            SLog.i(TAG, "frequent TranscodingVO=$frequentTranscodingVO")
++
++            totalProgressTracker = ProgressTracker(progressUnit, it)
++        }.mapIndexed { index, it ->
++            when {
++                frequentTranscodingVO.equals(it) -> VideoTransferringTask(index, it)
++                else -> VideoTranscodingTask(index, it)
++            }.also {
++                SLog.d(TAG, "$index-th task is $it, path=${it.mpFile.path()}")
++            }
++        }.partition {
++            it is VideoTransferringTask
++        }
++
++        // ---------- Insert gallery-style transitions between mergeTasks ----------
++        // Use a default config (can be exposed via Builder later)
++        val transitionCfg = TransitionConfig(durationMs = 800, fps = 30, initAlpha = 0f, targetAlpha = 1f, delayFraction = 0.15f)
++
++        // build an interleaved list: mergeTask0, transition0, mergeTask1, transition1, ...
++        val interleaved = mutableListOf<VideoTask>()
++        val plainMerge = mergeTasks.toMutableList()
++        for (i in plainMerge.indices) {
++            interleaved += plainMerge[i]
++            // if next exists, build a transition task between i and i+1
++            if (i + 1 < plainMerge.size) {
++                try {
++                    val curr = plainMerge[i].mpFile
++                    val next = plainMerge[i + 1].mpFile
++
++                    // extract frames using MediaMetadataRetriever (safe fallback)
++                    val retrA = android.media.MediaMetadataRetriever()
++                    val retrB = android.media.MediaMetadataRetriever()
++                    retrA.setDataSource(curr.path())
++                    retrB.setDataSource(next.path())
++                    // pick near-end frame for A (~150ms before end) and start frame for B (0)
++                    val durAms = retrA.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L
++                    val tsAUs = (maxOf(0L, durAms - 150) * 1000L)
++                    val bmpA = retrA.getFrameAtTime(tsAUs, android.media.MediaMetadataRetriever.OPTION_CLOSEST)
++                    val bmpB = retrB.getFrameAtTime(0L, android.media.MediaMetadataRetriever.OPTION_CLOSEST)
++                    retrA.release(); retrB.release()
++
++                    if (bmpA != null && bmpB != null) {
++                        // obtain encoder format to use for transition
++                        val videoFormat = builder.trackFormats.entries.firstOrNull { it.key.isVideo() }?.value
++                            ?: frequentTranscodingVO.videoCodecFormat
++                        val encoderFmt = MediaFormat.createVideoFormat("video/avc",
++                            videoFormat.getInteger(MediaFormat.KEY_WIDTH),
++                            videoFormat.getInteger(MediaFormat.KEY_HEIGHT)
++                        ).apply {
++                            // copy common params from reference videoFormat if present
++                            try {
++                                if (videoFormat.containsKey(MediaFormat.KEY_FRAME_RATE))
++                                    setInteger(MediaFormat.KEY_FRAME_RATE, videoFormat.getInteger(MediaFormat.KEY_FRAME_RATE))
++                                if (videoFormat.containsKey(MediaFormat.KEY_BIT_RATE))
++                                    setInteger(MediaFormat.KEY_BIT_RATE, videoFormat.getInteger(MediaFormat.KEY_BIT_RATE))
++                            } catch (_: Throwable) {}
++                            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
++                            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
++                            setString(MediaFormat.KEY_MIME, "video/avc")
++                        }
++
++                        val samples = TransitionGenerator.createEncodedTransitionSamples(bmpA, bmpB, transitionCfg, encoderFmt, slideType = 0)
++
++                        // build a transition task (id placeholder - will be reindexed into final list)
++                        val transitionMp = MPFile(File("transition_${i}"))
++                        val transitionTask = TransitionTransferringTask(-1, transitionMp, mapOf("video/avc" to samples))
++                        interleaved += transitionTask
++                    }
++                } catch (e: Exception) {
++                    SLog.w(TAG, "failed to create transition between ${plainMerge[i].path()} and ${plainMerge.getOrNull(i+1)?.path()}: $e")
++                }
++            }
++        }
++
++        // reassign ids sequentially across interleaved list and also append remaining transcoding tasks after them
++        val allTasks = mutableListOf<VideoTask>()
++        interleaved.forEachIndexed { idx, t ->
++            // set id by reflection / or by constructing new task wrappers; easiest is if tasks provide setter. If not, create new wrappers.
++            when (t) {
++                is VideoTransferringTask -> {
++                    allTasks += VideoTransferringTask(allTasks.size, t.mpFile)
++                }
++                is TransitionTransferringTask -> {
++                    val tt = TransitionTransferringTask(allTasks.size, t.mpFile, t.getAllTranscodedSamples())
++                    allTasks += tt
++                }
++                else -> {
++                    allTasks += VideoTransferringTask(allTasks.size, t.mpFile)
++                }
++            }
++        }
++
++        // append transcoding tasks after transfer tasks (preserves original plan: transcodes will be done and offer into queue)
++        transcodingTasks.forEach {
++            allTasks += when (it) {
++                is VideoTranscodingTask -> VideoTranscodingTask(allTasks.size, it.mpFile)
++                else -> it
++            }
++        }
++
++        // now we will partition final list into mergeTasks and transcodingTasks again
++        val finalMerge = allTasks.filterIsInstance<VideoTransferringTask>()
++        val finalTranscode = allTasks.filterIsInstance<VideoTranscodingTask>()
++
++        // set resulting lists
++        // Note: camel var names follow original method signature; replace local variables accordingly:
++        // We'll continue execution using finalMerge and finalTranscode below (existing code expects them)
++        // assign to local variables used later
++        // (we'll shadow the previous variables by re-binding)
++        @Suppress("UNCHECKED_CAST")
++        val mergedPair = Pair(finalMerge as List<VideoTask>, finalTranscode as List<VideoTask>)
++        // use mergedPair later by replacing usage of original (mergeTasks, transcodingTasks)
++        // For clarity we'll reassign the earlier vars (if they are mutable) else adapt subsequent code to use mergedPair
++        // (Because this is an in-file patch snippet, ensure subsequent code uses the new variables below.)
++        // Continue...
+*** End Patch for MotionScrap.prepareTasks(...) ***
+```
+
+> **Giải thích ngắn**:
+>
+> * Sau khi tạo `mergeTasks` gốc (những file có thể copy trực tiếp), patch tạo `TransitionTransferringTask` giữa từng cặp liền kề. Nó dùng `MediaMetadataRetriever` lấy frame near-end cho A và frame start cho B, render transition bằng `TransitionGenerator.createEncodedTransitionSamples(...)`, rồi gói kết quả vào `TransitionTransferringTask`.
+> * Các transition được interleave giữa các `VideoTransferringTask`, rồi reindex lại `id` sequential để `executeTasks` - loop sẽ tìm thấy `mergeTasks.peek()?.id == targetTaskId` như cũ.
+> * `encoderFmt` được dựng từ video format tham chiếu (từ `builder.trackFormats` nếu có, hoặc từ `frequentTranscodingVO`).
+
+---
+
+## Hướng dẫn áp patch & test
+
+1. Thêm hai file mới `TransitionGenerator.kt` và `TransitionTransferringTask.kt` vào module `com.example.livephotoconvert`.
+2. Thay thế hoặc chỉnh `MotionScrap.prepareTasks(...)` theo block sửa ở trên — lưu ý phần cuối mình đã comment/ghi chú để bạn đảm bảo các biến tiếp theo trong hàm sử dụng `finalMerge` / `finalTranscode` thay vì biến cũ. Nếu hàm `prepareTasks` còn rất dài, cách đơn giản: sau đoạn partition ban đầu (trong file gốc), chèn đoạn **"Insert gallery-style transitions"** mình cung cấp, rồi rebuild `mergeTasks` bằng `finalMerge` (list of VideoTransferringTask) và `transcodingTasks` bằng `finalTranscode`. (Mình để ý code gốc tiếp tục dùng `mergeTasks` / `transcodingTasks` để tính total frames / progress — đảm bảo thay thế cho phù hợp.)
+3. Build & run tests:
+
+   * Test unit: tạo 2 file ngắn, run export; kiểm tra muxer output có phần transition frames.
+   * Nếu muxer báo thiếu SPS/PPS: ensure `trackFormats` đã có csd-0/csd-1; nếu không, bạn có 2 lựa chọn:
+
+     * a) Khi tạo `encoderFmt`, copy csd-0/csd-1 từ `videoFormat` (nếu có).
+     * b) Ghi codec-config packet (BUFFER_FLAG_CODEC_CONFIG) đầu tiên vào muxer trước khi write các sample (VideoTransfer hiện skip codec-config — có thể cần thay đổi để không skip nếu track format chưa có csd).
+
+---
+
+## Những chỗ có thể cần tinh chỉnh tùy repo cụ thể
+
+* Cách reassign `id` cho task: tùy `VideoTask`/`VideoTransferringTask` implementation có cho phép set id hay không; nếu không, tạo `new` wrapper object như ví dụ để đảm bảo id được set đúng.
+* Tên MIME: ở project có thể dùng `MimeType.VIDEO_MP4` hoặc `MimeType.VIDEO_H264`; đảm bảo `encoderFormat` mime khớp với `VideoTransfer` trackFormats key.
+* Nếu `SlideShader` / `TransitionRenderer` đặt ở package khác, import đúng.
+* Nếu bạn muốn chuyển audio crossfade, cần tạo thêm audio AAC chunks tương ứng (mình không triển khai ở patch này, nhưng pattern tương tự: encode audio frames and add to samples map with key `"audio/aac"`).
+
+---
+
+Nếu bạn muốn, mình sẽ:
+
+* A) Cập nhật patch *sẵn sàng để dán* trực tiếp vào repository (mình sẽ xuất **diff unified** hoàn chỉnh cho từng file để bạn áp bằng `git apply`), hoặc
+* B) Thực hiện điều chỉnh để patch tương thích tuyệt đối với code base thực tế của bạn (ví dụ: tên class `VideoTransferringTask`/`VideoTransfer` signature/`MimeType` enum) — gửi cho mình các đoạn định nghĩa liên quan nếu khác hiện tại, mình sẽ sửa cho khớp.
+
+Bạn muốn mình **xuất toàn bộ diff unified** để apply trực tiếp (A) hay muốn mình điều chỉnh tên biến/class theo repo của bạn (B)?
