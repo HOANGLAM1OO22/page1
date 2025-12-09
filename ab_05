@@ -1,0 +1,195 @@
+Dưới đây là **PATCH CODE CHUẨN**, chèn trực tiếp vào **MotionScrap.executeTasks()**, đúng chỗ merge file, và hoàn toàn phù hợp với pipeline `VideoTransferringTask` / `VideoTranscodingTask`.
+
+---
+
+# ✅ **PATCH: Insert Transition Effect vào merge loop của MotionScrap**
+
+Bạn sẽ chèn đoạn sau vào **Thread B** trong `executeTasks`, ngay sau:
+
+```kotlin
+videoTransfer.writeTrack(task.mpFile)
+```
+
+hoặc
+
+```kotlin
+videoTransfer.writeTrack(task.mpFile, task.getAllTranscodedSamples())
+```
+
+---
+
+# ⭐ PATCH HOÀN CHỈNH
+
+### ➤ 1) Khai báo TransitionRenderer + TransitionConfig
+
+Trong đầu `executeTasks()`:
+
+```kotlin
+// Transition configuration (same for entire export)
+val transitionCfg = TransitionConfig(
+    durationMs = 600,
+    fps = 30,
+    initAlpha = 0f,
+    targetAlpha = 1f,
+    delayFraction = 0.15f,
+)
+
+// Global renderer for transition frames
+var transitionRenderer: TransitionRenderer? = null
+var transitionTrackMime = MimeType.VIDEO_MP4.value
+```
+
+---
+
+### ➤ 2) Tạo renderer khi output format đã known
+
+Trong merge thread, khi đã có `videoTransfer` và biết output video size/format:
+
+```kotlin
+// Prepare transition renderer based on output surface
+if (transitionRenderer == null) {
+    val (w, h) = videoTransfer.getOutputVideoSize()
+    val encodeSurface = videoTransfer.createVirtualInputSurface() // small helper you create
+    transitionRenderer = TransitionRenderer(encodeSurface)
+    transitionRenderer!!.init()
+}
+```
+
+> 📝 Bạn sẽ cần thêm helper `getOutputVideoSize()` và `createVirtualInputSurface()` trong `VideoTransfer`
+> (thường là wrap encoder surface – mình sẽ viết nếu bạn cần).
+
+---
+
+### ➤ 3) **GEN TRANSITION SAMPLES BETWEEN TWO FILES**
+
+Trước merge loop, chuẩn bị map để chứa các transition sample đã encode:
+
+```kotlin
+val transitionSamples = mutableMapOf<Int, List<Pair<ByteBuffer, MediaCodec.BufferInfo>>>()
+```
+
+Sau mỗi transcoding xong, bạn có frame cuối của video → dùng để render transition.
+
+Bạn tạo helper:
+
+```kotlin
+private fun generateTransitionSamples(
+    id: Int,
+    prevBmp: Bitmap,
+    nextBmp: Bitmap,
+    renderer: TransitionRenderer,
+    cfg: TransitionConfig,
+    trackMime: String
+): List<Pair<ByteBuffer, MediaCodec.BufferInfo>> {
+
+    val encoded = mutableListOf<Pair<ByteBuffer, MediaCodec.BufferInfo>>()
+
+    val steps = max(1, ((cfg.durationMs / 1000f) * cfg.fps).toInt())
+    val frameDurUs = 1_000_000L / cfg.fps
+
+    var pts = 0L
+
+    for (i in 0 until steps) {
+        val weight = i / (steps - 1f)
+        renderer.renderTransitionFrame(prevBmp, nextBmp, cfg, weight, pts)
+
+        // Collect encoded buffer from encoder output
+        val (buf, info) = renderer.drainOneEncodedFrame(trackMime)
+        encoded += buf to info
+
+        pts += frameDurUs
+    }
+
+    return encoded
+}
+```
+
+---
+
+### ➤ 4) **INSERT TRANSITION INSIDE MERGE LOOP**
+
+**Đây là đoạn code bạn hỏi.**
+
+Chèn ngay vào merge-thread:
+
+```kotlin
+while (targetTaskId < numTasks) {
+
+    val task = mergeTasks.poll()
+    val mp = task.mpFile
+
+    // 1) Write this task’s video
+    if (task.isFromTranscoding()) {
+        videoTransfer.writeTrack(mp, task.getAllTranscodedSamples())
+    } else {
+        videoTransfer.writeTrack(mp)
+    }
+
+    // 2) If no next file → do not insert transition
+    val nextId = task.id + 1
+    if (nextId >= numTasks) {
+        targetTaskId++
+        continue
+    }
+
+    // 3) If transition already generated for this ID, write it
+    val trans = transitionSamples[nextId]
+    if (trans != null) {
+        videoTransfer.writeTrack(mp, mapOf(transitionTrackMime to trans))
+        targetTaskId++
+        continue
+    }
+
+    // 4) Otherwise generate transition samples
+    val prevBmp = mp.getLastFrameBitmap()       // helper: using retriever
+    val nextMp = getMpFileById(nextId)          // resolve next file
+    val nextBmp = nextMp.getFirstFrameBitmap()  // helper
+
+    val renderer = transitionRenderer!!
+
+    val encoded = generateTransitionSamples(
+        id = nextId,
+        prevBmp = prevBmp,
+        nextBmp = nextBmp,
+        renderer = renderer,
+        cfg = transitionCfg,
+        trackMime = transitionTrackMime
+    )
+
+    transitionSamples[nextId] = encoded
+
+    // 5) Write transition clip
+    videoTransfer.writeTrack(mp, mapOf(transitionTrackMime to encoded))
+
+    targetTaskId++
+}
+```
+
+---
+
+# 💡 Tóm tắt luồng thực thi:
+
+Giữa mỗi cặp file:
+
+```
+F0 → Transition(F0→F1) → F1 → Transition(F1→F2) → F2 → ...
+```
+
+Code:
+
+1. Merge file
+2. Check next file
+3. Extract last frame (current) / first frame (next)
+4. Use `TransitionRenderer` + `SlideShader` render transition frames
+5. Encode → Write to muxer using `videoTransfer.writeTrack(...)`
+
+---
+
+# 🧩 Bạn cần mình viết:
+
+* Full helper functions (`getMpFileById()`, `getLastFrameBitmap()`, `getFirstFrameBitmap()`)
+* Full implementation `TransitionRenderer.drainOneEncodedFrame`
+* Full integration vào VideoTransfer (surface management)
+* Patch hoàn chỉnh cho MotionScrap thành file `.patch`
+
+👉 **Chỉ cần bảo mình “Generate full file patch”, mình sẽ gửi hoàn chỉnh.**
