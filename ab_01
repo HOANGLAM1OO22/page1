@@ -1,0 +1,705 @@
+package com.example.livephotoconvert
+
+import android.content.ContentValues
+import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
+import android.provider.MediaStore
+import android.util.Log
+import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.rule.GrantPermissionRule
+import org.junit.Rule
+import org.junit.Test
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+
+class MergeVideosSafeTest {
+
+    // ------------------------------
+    // 1) COPY ASSET → CACHE
+    // ------------------------------
+    private fun copyAssetToCache(name: String): File {
+        val instr = InstrumentationRegistry.getInstrumentation()
+        val testCtx = instr.context        // androidTest context (has assets)
+        val targetCtx = instr.targetContext // app under test context
+
+        val outFile = File(targetCtx.cacheDir, name)
+
+        testCtx.assets.open(name).use { input ->
+            FileOutputStream(outFile).use { output ->
+                input.copyTo(output)
+            }
+        }
+        return outFile
+    }
+
+    // ------------------------------
+    // Grant permissions (needed for MediaStore write)
+    // ------------------------------
+    @get:Rule
+    val permissionRule: GrantPermissionRule =
+        GrantPermissionRule.grant(
+            android.Manifest.permission.READ_MEDIA_VIDEO,
+            android.Manifest.permission.READ_MEDIA_IMAGES,
+            android.Manifest.permission.READ_EXTERNAL_STORAGE,
+            android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+        )
+
+    // ------------------------------
+    // 2) TEST: MERGE FROM ASSETS
+    // ------------------------------
+    @Test
+    fun mergeVideosFromAssets() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+
+        // Copy asset → cache
+        val file1 = copyAssetToCache("7.mp4")
+        val file2 = copyAssetToCache("8.mp4")
+
+        // Output inside app-private storage
+        val mergedFile = File(ctx.getExternalFilesDir(null), "output_merged.mp4")
+        val mergedPath = mergedFile.absolutePath
+
+        Log.i("huong", "Merging into: $mergedPath")
+
+        mergeVideosRemuxSafe(
+            listOf(file1.absolutePath, file2.absolutePath),
+            mergedPath
+        )
+
+        Log.i("huong", "Merged OK: $mergedPath (size=${mergedFile.length()})")
+
+        // 3) EXPORT to MediaStore (Movies folder)
+        val uri = exportToMediaStore(ctx, mergedFile)
+
+        Log.i("huong", "Exported to MediaStore: $uri")
+    }
+
+    // ------------------------------
+    // 3) EXPORT FILE → MEDIASTORE (Movies folder)
+    // ------------------------------
+    private fun exportToMediaStore(context: Context, srcFile: File): String {
+        val resolver = context.contentResolver
+
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "merged_${System.currentTimeMillis()}.mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/") // visible in Gallery
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+
+        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw RuntimeException("Cannot insert video into MediaStore")
+
+        resolver.openOutputStream(uri)?.use { output ->
+            srcFile.inputStream().use { input ->
+                input.copyTo(output)
+            }
+        }
+
+        // Mark file as visible
+        values.clear()
+        values.put(MediaStore.Video.Media.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+
+        return uri.toString()
+    }
+
+    // ------------------------------
+    // 4) MERGE REMUX (Safe)
+    // ------------------------------
+    private fun mergeVideosRemuxSafe(inputFiles: List<String>, outputPath: String) {
+        val muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+        var videoTrackIndex = -1
+        var muxerStarted = false
+        var ptsOffsetUs = 0L
+
+        val buffer = ByteBuffer.allocate(2 * 1024 * 1024)
+        val bufferInfo = MediaCodec.BufferInfo()
+
+        try {
+            for (filePath in inputFiles) {
+
+                val extractor = MediaExtractor()
+                extractor.setDataSource(filePath)
+
+                var videoTrack = -1
+                var format: MediaFormat? = null
+
+                for (i in 0 until extractor.trackCount) {
+                    val f = extractor.getTrackFormat(i)
+                    val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
+                    if (mime.startsWith("video/")) {
+                        videoTrack = i
+                        format = f
+                        break
+                    }
+                }
+
+                if (videoTrack == -1 || format == null) {
+                    extractor.release()
+                    continue
+                }
+
+                extractor.selectTrack(videoTrack)
+
+                if (!muxerStarted) {
+                    videoTrackIndex = muxer.addTrack(format)
+                    muxer.start()
+                    muxerStarted = true
+                }
+
+                var lastPts = 0L
+
+                while (true) {
+                    bufferInfo.size = extractor.readSampleData(buffer, 0)
+                    if (bufferInfo.size < 0) break
+
+                    bufferInfo.offset = 0
+                    bufferInfo.presentationTimeUs = extractor.sampleTime + ptsOffsetUs
+                    bufferInfo.flags = extractor.sampleFlags
+
+                    lastPts = extractor.sampleTime
+
+                    muxer.writeSampleData(videoTrackIndex, buffer, bufferInfo)
+                    extractor.advance()
+                }
+
+                ptsOffsetUs += lastPts
+                extractor.release()
+            }
+        } finally {
+            try { if (muxerStarted) muxer.stop() } catch (_: Exception) {}
+            muxer.release()
+        }
+    }
+}
+
+
+package com.example.livephotoconvert
+
+import android.content.ContentValues
+import android.content.Context
+import android.graphics.Bitmap
+import android.media.*
+import android.opengl.EGL14
+import android.opengl.EGLExt
+import android.opengl.GLES20
+import android.opengl.GLUtils
+import android.provider.MediaStore
+import android.util.Log
+import android.view.Surface
+import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.rule.GrantPermissionRule
+import org.junit.Rule
+import org.junit.Test
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.max
+
+// ------------------------------------------------------------
+// Transition config
+// ------------------------------------------------------------
+data class TransitionConfig(
+    val durationMs: Int = 800,
+    val fps: Int = 30,
+    val initAlpha: Float = 0f,
+    val targetAlpha: Float = 1f,
+    val delayFraction: Float = 0.2f
+)
+
+// ------------------------------------------------------------
+// SlideShader: implements Gallery-style threshold window logic
+// slide types:
+// 0 = HORIZONTAL (reveal second inside horizontal moving band centered vertically)
+// 1 = VERTICAL (reveal second inside vertical band centered horizontally)
+// 2 = HORIZONTAL_TO_CENTER (first -> center reveal pattern)
+// 3 = VERTICAL_TO_CENTER
+// ------------------------------------------------------------
+object SlideShader {
+    private const val VERTEX = """
+        attribute vec4 aPosition;
+        attribute vec2 aTexCoord;
+        varying vec2 vTexCoord;
+        void main() {
+            vTexCoord = aTexCoord;
+            gl_Position = aPosition;
+        }
+    """
+
+    private const val FRAGMENT = """
+        precision mediump float;
+        varying vec2 vTexCoord;
+        uniform sampler2D uTexA;
+        uniform sampler2D uTexB;
+        uniform float uWeight;      // 0..1
+        uniform float uInitAlpha;   // incoming alpha start
+        uniform float uTargetAlpha; // incoming alpha end
+        uniform float uDelay;       // fraction 0..1
+        uniform int uSlideType;     // 0..3
+        uniform float uLeft;
+        uniform float uRight;
+        uniform float uTop;
+        uniform float uBottom;
+
+        // compute alpha for incoming (B) based on weight and delay
+        float computeAlpha(float w) {
+            if (w <= uDelay) return uInitAlpha;
+            float t = (w - uDelay) / (1.0 - uDelay);
+            return mix(uInitAlpha, uTargetAlpha, t);
+        }
+
+        void main() {
+            // check bounds -- if outside the region, sample edge (clamp) implicitly by sampling coords
+            float x = (vTexCoord.x - uLeft) / max(0.0001, (uRight - uLeft));
+            float y = (vTexCoord.y - uBottom) / max(0.0001, (uTop - uBottom));
+
+            // clamp to 0..1 for normalized local coords inside bounds
+            // we won't discard; we'll decide which texture to show using mask
+            x = clamp(x, 0.0, 1.0);
+            y = clamp(y, 0.0, 1.0);
+
+            vec4 colA = texture2D(uTexA, vTexCoord);
+            vec4 colB = texture2D(uTexB, vTexCoord);
+
+            float w = uWeight;
+            float alphaB = computeAlpha(w);
+
+            bool useB = false;
+
+            if (uSlideType == 0) {
+                // HORIZONTAL: sliding band across vertical axis (y)
+                float half = 0.5 * w;
+                float low = 0.5 - half;
+                float high = 0.5 + half;
+                useB = (y >= low && y <= high);
+            } else if (uSlideType == 1) {
+                // VERTICAL: sliding band across horizontal axis (x)
+                float half = 0.5 * w;
+                float low = 0.5 - half;
+                float high = 0.5 + half;
+                useB = (x >= low && x <= high);
+            } else if (uSlideType == 2) {
+                // HORIZONTAL_TO_CENTER: region grows from edges towards center (B outside, A inside)
+                float low = w * 0.0; // 0..w mapped -> show A center region
+                float high = 1.0 - w * 0.0;
+                // Gallery variant: show A in center when within [0.5*w, 1-0.5*w]
+                float half = 0.5 * w;
+                useB = !(y >= half && y <= (1.0 - half));
+            } else {
+                // VERTICAL_TO_CENTER
+                float half = 0.5 * w;
+                useB = !(x >= half && x <= (1.0 - half));
+            }
+
+            // blend using computed alpha for B
+            // If mask says useB true, we favor B, otherwise A, but we still apply alphaB for smoothness.
+            vec4 outCol = mix(colA, colB, alphaB);
+
+            // A stronger step-like effect: if useB, weight B more
+            // amplify B when useB true
+            if (useB) {
+                outCol = mix(colA, colB, clamp(alphaB + 0.3, 0.0, 1.0));
+            }
+
+            // premultiply and set alpha=1 for encoder-safe frames
+            outCol.rgb *= outCol.a;
+            outCol.a = 1.0;
+            gl_FragColor = outCol;
+        }
+    """
+
+    private var program = 0
+    private var aPos = -1
+    private var aTex = -1
+    private var uTexA = -1
+    private var uTexB = -1
+    private var uWeight = -1
+    private var uInitAlpha = -1
+    private var uTargetAlpha = -1
+    private var uDelay = -1
+    private var uSlideType = -1
+    private var uLeft = -1
+    private var uRight = -1
+    private var uTop = -1
+    private var uBottom = -1
+
+    private val quad = floatArrayOf(
+        -1f, -1f,  0f, 1f,
+         1f, -1f,  1f, 1f,
+        -1f,  1f,  0f, 0f,
+         1f,  1f,  1f, 0f
+    )
+
+    fun ensureCompiled() {
+        if (program != 0) return
+        val v = loadShader(GLES20.GL_VERTEX_SHADER, VERTEX)
+        val f = loadShader(GLES20.GL_FRAGMENT_SHADER, FRAGMENT)
+        program = GLES20.glCreateProgram()
+        GLES20.glAttachShader(program, v)
+        GLES20.glAttachShader(program, f)
+        GLES20.glLinkProgram(program)
+
+        aPos = GLES20.glGetAttribLocation(program, "aPosition")
+        aTex = GLES20.glGetAttribLocation(program, "aTexCoord")
+        uTexA = GLES20.glGetUniformLocation(program, "uTexA")
+        uTexB = GLES20.glGetUniformLocation(program, "uTexB")
+        uWeight = GLES20.glGetUniformLocation(program, "uWeight")
+        uInitAlpha = GLES20.glGetUniformLocation(program, "uInitAlpha")
+        uTargetAlpha = GLES20.glGetUniformLocation(program, "uTargetAlpha")
+        uDelay = GLES20.glGetUniformLocation(program, "uDelay")
+        uSlideType = GLES20.glGetUniformLocation(program, "uSlideType")
+        uLeft = GLES20.glGetUniformLocation(program, "uLeft")
+        uRight = GLES20.glGetUniformLocation(program, "uRight")
+        uTop = GLES20.glGetUniformLocation(program, "uTop")
+        uBottom = GLES20.glGetUniformLocation(program, "uBottom")
+    }
+
+    private fun loadShader(type: Int, src: String): Int {
+        val s = GLES20.glCreateShader(type)
+        GLES20.glShaderSource(s, src)
+        GLES20.glCompileShader(s)
+        return s
+    }
+
+    /**
+     * draw: texA = previous frame, texB = next frame
+     * boundaries: left/right/top/bottom in normalized 0..1 (default 0..1 full)
+     */
+    fun draw(
+        texA: Int, texB: Int, weight: Float,
+        initAlpha: Float, targetAlpha: Float, delay: Float,
+        slideType: Int,
+        left: Float = 0f, right: Float = 1f, top: Float = 1f, bottom: Float = 0f
+    ) {
+        ensureCompiled()
+        GLES20.glUseProgram(program)
+
+        val bb = ByteBuffer.allocateDirect(quad.size * 4).order(ByteOrder.nativeOrder())
+        val fb = bb.asFloatBuffer().put(quad).apply { position(0) }
+
+        fb.position(0)
+        GLES20.glEnableVertexAttribArray(aPos)
+        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, fb)
+
+        fb.position(2)
+        GLES20.glEnableVertexAttribArray(aTex)
+        GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, fb)
+
+        GLES20.glUniform1f(uWeight, weight)
+        GLES20.glUniform1f(uInitAlpha, initAlpha)
+        GLES20.glUniform1f(uTargetAlpha, targetAlpha)
+        GLES20.glUniform1f(uDelay, delay)
+        GLES20.glUniform1i(uSlideType, slideType)
+        GLES20.glUniform1f(uLeft, left)
+        GLES20.glUniform1f(uRight, right)
+        GLES20.glUniform1f(uTop, top)
+        GLES20.glUniform1f(uBottom, bottom)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texA)
+        GLES20.glUniform1i(uTexA, 0)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texB)
+        GLES20.glUniform1i(uTexB, 1)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(aPos)
+        GLES20.glDisableVertexAttribArray(aTex)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glUseProgram(0)
+    }
+}
+
+// ------------------------------------------------------------
+// TransitionRenderer (EGL, renders to encoder input surface)
+// ------------------------------------------------------------
+class TransitionRenderer(private val encoderInputSurface: Surface) {
+    private var eglDisplay: android.opengl.EGLDisplay? = null
+    private var eglContext: android.opengl.EGLContext? = null
+    private var eglSurface: android.opengl.EGLSurface? = null
+
+    fun init() {
+        eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        val ver = IntArray(2)
+        EGL14.eglInitialize(eglDisplay, ver, 0, ver, 1)
+
+        val attrib = intArrayOf(
+            EGL14.EGL_RED_SIZE, 8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_NONE
+        )
+        val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
+        val num = IntArray(1)
+        EGL14.eglChooseConfig(eglDisplay, attrib, 0, configs, 0, 1, num, 0)
+        val cfg = configs[0]!!
+        val ctxAttr = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
+        eglContext = EGL14.eglCreateContext(eglDisplay, cfg, EGL14.EGL_NO_CONTEXT, ctxAttr, 0)
+        eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, cfg, encoderInputSurface, intArrayOf(EGL14.EGL_NONE), 0)
+        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        SlideShader.ensureCompiled()
+    }
+
+    private fun loadTexture(bmp: Bitmap): Int {
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1, ids, 0)
+        val tex = ids[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        return tex
+    }
+
+    /**
+     * Render transition frames between A and B.
+     * presentationBaseUs: microseconds where the first transition frame's PTS should be.
+     * returns number of frames rendered.
+     */
+    fun renderTransitionSequence(
+        bmpA: Bitmap, bmpB: Bitmap,
+        cfg: TransitionConfig,
+        slideType: Int,
+        presentationBaseUs: Long
+    ): Int {
+        val steps = max(1, ((cfg.durationMs.toDouble() / 1000.0) * cfg.fps).toInt())
+        val texA = loadTexture(bmpA)
+        val texB = loadTexture(bmpB)
+
+        val frameDurUs = 1_000_000L / cfg.fps
+
+        for (i in 0 until steps) {
+            val weight = i.toFloat() / (steps - 1).coerceAtLeast(1)
+            GLES20.glViewport(0, 0, bmpA.width, bmpA.height)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+
+            // boundaries full frame for now; could be computed from Model in future
+            SlideShader.draw(
+                texA, texB, weight, cfg.initAlpha, cfg.targetAlpha, cfg.delayFraction,
+                slideType, 0f, 1f, 1f, 0f
+            )
+
+            val ptsUs = presentationBaseUs + i * frameDurUs
+            val ptsNs = ptsUs * 1000L
+            EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, ptsNs)
+            EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+        }
+
+        GLES20.glDeleteTextures(2, intArrayOf(texA, texB), 0)
+        return steps
+    }
+
+    fun release() {
+        try {
+            EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+            eglSurface?.let { EGL14.eglDestroySurface(eglDisplay, it) }
+            eglContext?.let { EGL14.eglDestroyContext(eglDisplay, it) }
+            EGL14.eglTerminate(eglDisplay)
+        } catch (_: Throwable) {}
+    }
+}
+
+// ------------------------------------------------------------
+// Test class: merge with transition using the Gallery-like shader
+// ------------------------------------------------------------
+class MergeVideosGalleryStyleTest {
+
+    @get:Rule
+    val permissionRule: GrantPermissionRule =
+        GrantPermissionRule.grant(
+            android.Manifest.permission.READ_MEDIA_VIDEO,
+            android.Manifest.permission.READ_MEDIA_IMAGES,
+            android.Manifest.permission.READ_EXTERNAL_STORAGE,
+            android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+        )
+
+    private fun copyAssetToCache(name: String): File {
+        val instr = InstrumentationRegistry.getInstrumentation()
+        val testCtx = instr.context
+        val targetCtx = instr.targetContext
+        val out = File(targetCtx.cacheDir, name)
+        testCtx.assets.open(name).use { inp ->
+            FileOutputStream(out).use { outp -> inp.copyTo(outp) }
+        }
+        return out
+    }
+
+    private fun getVideoSize(fmt: MediaFormat): Pair<Int, Int> {
+        var w = fmt.getInteger(MediaFormat.KEY_WIDTH)
+        var h = fmt.getInteger(MediaFormat.KEY_HEIGHT)
+        val rotation = if (fmt.containsKey(MediaFormat.KEY_ROTATION)) fmt.getInteger(MediaFormat.KEY_ROTATION) else 0
+        if (rotation == 90 || rotation == 270) {
+            val tmp = w; w = h; h = tmp
+        }
+        return w to h
+    }
+
+    @Test
+    fun runMerge() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val f1 = copyAssetToCache("7.mp4")
+        val f2 = copyAssetToCache("8.mp4")
+        val out = File(ctx.getExternalFilesDir(null), "merged_gallery_slide.mp4")
+        if (out.exists()) out.delete()
+        val cfg = TransitionConfig(durationMs = 800, fps = 30, initAlpha = 0f, targetAlpha = 1f, delayFraction = 0.15f)
+        mergeWithGallerySlide(listOf(f1.path, f2.path), out.path, cfg)
+        Log.i("Merge", "Output saved, size=${out.length()}")
+    }
+
+    private fun extractFrame(path: String, fromEnd: Boolean): Bitmap {
+        val retr = MediaMetadataRetriever()
+        retr.setDataSource(path)
+        val durMs = retr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L
+        val timeUs = if (fromEnd) (maxOf(0L, durMs - 150)) * 1000L else 0L
+        val bmp = retr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+        retr.release()
+        return bmp!!
+    }
+
+    private fun mergeWithGallerySlide(input: List<String>, outPath: String, cfg: TransitionConfig) {
+        // pick encoder size based on first video format
+        val firstEx = MediaExtractor()
+        firstEx.setDataSource(input.first())
+        var firstFmt: MediaFormat? = null
+        for (i in 0 until firstEx.trackCount) {
+            val f = firstEx.getTrackFormat(i)
+            if (f.getString(MediaFormat.KEY_MIME)?.startsWith("video") == true) { firstFmt = f; break }
+        }
+        firstEx.release()
+        val (OUT_W, OUT_H) = getVideoSize(firstFmt!!)
+        Log.i("Merge", "Encoder size: ${OUT_W}x${OUT_H}")
+
+        val encoderFmt = MediaFormat.createVideoFormat("video/avc", OUT_W, OUT_H).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, cfg.fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+
+        val encoder = MediaCodec.createEncoderByType("video/avc")
+        encoder.configure(encoderFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val encoderSurface = encoder.createInputSurface()
+        encoder.start()
+
+        val muxer = MediaMuxer(outPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        var muxStarted = false
+        var muxTrack = -1
+
+        val buffer = ByteBuffer.allocate(2 * 1024 * 1024)
+        val info = MediaCodec.BufferInfo()
+
+        var ptsOffsetUs = 0L
+
+        val renderer = TransitionRenderer(encoderSurface)
+        renderer.init()
+
+        try {
+            // wait for encoder output format then start muxer
+            var fmtReady = false
+            while (!fmtReady) {
+                val idx = encoder.dequeueOutputBuffer(info, 10_000)
+                if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    val newFmt = encoder.outputFormat
+                    muxTrack = muxer.addTrack(newFmt)
+                    muxer.start()
+                    muxStarted = true
+                    fmtReady = true
+                } else if (idx >= 0) {
+                    encoder.releaseOutputBuffer(idx, false)
+                }
+            }
+
+            fun drainEncoderToMuxer() {
+                while (true) {
+                    val idx = encoder.dequeueOutputBuffer(info, 0)
+                    if (idx >= 0) {
+                        val encoded = encoder.getOutputBuffer(idx)!!
+                        if (info.size > 0 && muxStarted) {
+                            encoded.position(info.offset)
+                            encoded.limit(info.offset + info.size)
+                            // trust codec PTS (we set EGL presentation times), do not add extra offset here
+                            muxer.writeSampleData(muxTrack, encoded, info)
+                        }
+                        encoder.releaseOutputBuffer(idx, false)
+                        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+                    } else if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) break
+                }
+            }
+
+            // remux each input, insert transitions between files
+            for ((index, path) in input.withIndex()) {
+                val extractor = MediaExtractor()
+                extractor.setDataSource(path)
+
+                var track = -1
+                var fmt: MediaFormat? = null
+                for (i in 0 until extractor.trackCount) {
+                    val f = extractor.getTrackFormat(i)
+                    if (f.getString(MediaFormat.KEY_MIME)?.startsWith("video") == true) { track = i; fmt = f; break }
+                }
+                if (track == -1) { extractor.release(); continue }
+                extractor.selectTrack(track)
+
+                var lastPtsThisUs = 0L
+                while (true) {
+                    val sz = extractor.readSampleData(buffer, 0)
+                    if (sz < 0) break
+                    info.size = sz
+                    info.offset = 0
+                    info.presentationTimeUs = extractor.sampleTime + ptsOffsetUs
+                    info.flags = extractor.sampleFlags
+                    if (muxStarted && muxTrack >= 0) muxer.writeSampleData(muxTrack, buffer, info)
+                    lastPtsThisUs = extractor.sampleTime
+                    extractor.advance()
+                }
+                extractor.release()
+
+                // advance offset by last timestamp of this file
+                ptsOffsetUs += lastPtsThisUs
+
+                // if not last file, render transition
+                if (index < input.size - 1) {
+                    val curr = path
+                    val nxt = input[index + 1]
+                    val bmpA = extractFrame(curr, fromEnd = true)
+                    val bmpB = extractFrame(nxt, fromEnd = false)
+
+                    // base PTS for first transition frame = current ptsOffsetUs (microseconds)
+                    val baseUs = ptsOffsetUs
+                    val rendered = renderer.renderTransitionSequence(bmpA, bmpB, cfg, slideType = 0, presentationBaseUs = baseUs)
+
+                    // advance pts offset by transition duration
+                    val transitionUs = rendered * (1_000_000L / cfg.fps)
+                    ptsOffsetUs += transitionUs
+
+                    // drain encoder and write encoded transition frames to muxer
+                    drainEncoderToMuxer()
+                }
+            }
+
+            // finish
+            encoder.signalEndOfInputStream()
+            drainEncoderToMuxer()
+
+        } finally {
+            try { renderer.release() } catch (_: Throwable) {}
+            try { encoder.stop(); encoder.release() } catch (_: Exception) {}
+            try { if (muxStarted) muxer.stop(); muxer.release() } catch (_: Exception) {}
+        }
+    }
+}
+
