@@ -1,0 +1,335 @@
+Tuyệt — mình sẽ phân tích kỹ luồng của `MotionScrap` và chỉ rõ **chỗ nào phải chèn transition**, **làm sao tạo encoded transition samples** và **làm thế nào để đưa chúng vào pipeline (VideoTransfer / mergeTasks)** sao cho tương thích với kiến trúc hiện tại. Mình cũng cung cấp đoạn code thực tế (khung/utility) bạn có thể dán vào dự án để tạo transition frames được encode và push vào queue giống như một task bình thường.
+
+---
+
+# Tóm tắt ngắn về pipeline hiện tại (trong MotionScrap)
+
+1. `prepareTasks(...)` phân loại files thành:
+
+   * `mergeTasks` (`VideoTransferringTask`) — những file có thể *dùng nguyên* (no transcoding)
+   * `transcodingTasks` (`VideoTranscodingTask`) — cần transcode trước khi merge
+2. `executeTasks(...)` chạy 2 thread:
+
+   * Thread A: xử lý `transcodingTasks` từng file, chuyển kết quả thành `VideoTransferringTask` và `mergeTasks.offer(VideoTransferringTask(it))`
+   * Thread B: chờ queue `mergeTasks` theo thứ tự id (targetTaskId), gọi `videoTransfer.writeTrack(task.mpFile, task.getAllTranscodedSamples())` (nếu là fromTranscoding) hoặc `videoTransfer.writeTrack(task.mpFile)` (nếu là nguyên bản).
+3. `VideoTransfer.writeTrack(...)` chịu trách nhiệm `muxer.writeSampleData` với track index đã tạo sẵn (trackFormats được add lúc builder init).
+4. Progress: `eventListener.onEachFrameTransferred(...)` và `onTransferComplete(...)` để cập nhật progress.
+
+=> Kết luận: **để chèn transition**, cần biến transition thành *một task* (giống `VideoTransferringTask`) chứa **các sample đã encoded** (list của `ByteBuffer + MediaCodec.BufferInfo`) để `VideoTransfer.writeTrack()` có thể viết chúng như các sample khác vào muxer.
+
+---
+
+# Chiến lược thực hiện (recommended, tương thích nhất)
+
+1. **Tạo hàm utility** `createEncodedTransitionSamples(bmpA, bmpB, cfg, outFormat, basePtsUs)`:
+
+   * Khởi tạo một `MediaCodec` encoder (video) với `outFormat` (same format như trackFormats đã add vào `VideoTransfer` hoặc `frequentTranscodingVO`).
+   * Lấy `encoder.createInputSurface()` và tạo `EGL` context/Surface (`TransitionRenderer` tương tự mô tả trước).
+   * Render các frame transition (dùng `SlideShader`/TransitionRenderer) vào surface, đặt `eglPresentationTimeANDROID` với PTS thích hợp (basePtsUs + i * frameDurationUs).
+   * Drain encoder output: đọc output buffer, copy thành `ByteBuffer` độc lập + `MediaCodec.BufferInfo` và push vào `List<Pair<ByteBuffer, BufferInfo>>`.
+   * Kết thúc bằng queue EOS cho encoder và tiếp tục drain cho đến khi nhận `BUFFER_FLAG_END_OF_STREAM`.
+   * Trả về danh sách encoded samples (với presentationTimeUs đã set đúng).
+
+2. **Tạo `VideoTransferringTask` đặc biệt** (ví dụ `VideoTransferringTaskTransition`) hoặc reuse `VideoTransferringTask`/`MPFile`:
+
+   * Tạo một `MPFile` giả (hoặc task có cờ `isTransition = true`) để chứa samples vừa tạo: `task.addSamples("video/avc", samples)`.
+   * Đặt `task.id` = vị trí giữa file hiện tại và file kế tiếp (hoặc assign id tăng – nhưng **quan trọng**: thứ tự id phải khớp với `targetTaskId` trong Thread B).
+   * `mergeTasks.offer(transitionTask)` vào queue `mergeTasks` tại chỗ thích hợp (sau khi đã push current file).
+
+3. **Ở Thread B (merge loop)**: khi poll `mergeTasks`, nếu task là transition, `videoTransfer.writeTrack(task.mpFile, task.getAllTranscodedSamples())` sẽ được gọi, và các sample transition sẽ được ghi vào muxer cùng thứ tự timestamp.
+
+4. **Timestamps & offsets**:
+
+   * Khi tạo encoded samples, **presentationTimeUs** phải liên tục nối tiếp phần trước trong file hiện tại (tức basePtsUs = lastTransferredTimestampUs). MotionScrap dùng `lastTransferredTimestampUs` để điều chỉnh timestamps trước khi ghi — nhưng để an toàn, set PTS của các frame transition bằng `lastTransferredTimestampUs + i*frameDurUs`.
+   * Sau khi `writeTrack(...)`, `VideoTransfer` sẽ tăng `lastTransferredTimestampUs` dựa trên `duration` do bạn trả về — điều này phải khớp với số microseconds bạn đã dùng trong encoder khi render.
+
+5. **Progress reporting**:
+
+   * Gọi `eventListener.onEachFrameTransferred(source, "video/avc", bufferInfo)` tương tự như viết bình thường, để trackers count frame và báo progress.
+
+6. **Threading / blocking**:
+
+   * Tạo encoded samples cho transition có thể tốn thời gian CPU/GPU; nên tạo trước (trong thread xử lý transcoding hoặc một task riêng) để không block loop ghi. Trong kiến trúc hiện tại, nhiều nơi đã dùng thread pool: bạn có thể generate transition samples trong Thread A (sau khi hoàn thành current file transcode) và `offer()` vào `mergeTasks`. Thread B sẽ pick và write.
+
+---
+
+# Vấn đề cần lưu ý (cần cẩn trọng)
+
+* **SPS / PPS (csd-0/csd-1)**: Format để addTrack trong `VideoTransfer` đã được add sẵn (prepareTasks thêm `builder.addTrackFormat(...)`). Encoder của transition phải tạo ra NALs tương thích với format (H.264). Khi bạn thu các output buffers, những buffer đầu có thể chứa `BUFFER_FLAG_CODEC_CONFIG` (SPS/PPS). `VideoTransfer.writeTrack` hiện đang skip codec-config buffers (xem `if (bufferInfo.containFlag(MediaCodec.BUFFER_FLAG_CODEC_CONFIG) -> skip codec-config)`). Đảm bảo track format trong `VideoTransfer` đã có csd-0/csd-1 — hoặc nếu không, bạn có thể giữ codec-config packet và `VideoTransfer` sẽ skip nên muxer track vẫn ổn (nhưng player cần SPS/PPS ở track format; motionScrap prepareTasks đã thêm formats từ `referenceFile.getCodecFormats()` — đảm bảo format hợp lệ).
+* **Color format & encoder config**: khi cấu hình encoder cho transition, set bitrate, i-frame interval, frame rate phù hợp với trackFormat (thường lấy từ `frequentTranscodingVO` hoặc `trackInfos`).
+* **Timestamps monotonic / overlapping**: MotionScrap có logic `isMonotonicTimestamp` và `adjustTimeRange`. Đảm bảo PTS của transition khớp với lastTransferredTimestampUs để không gây overlap.
+* **Size & rotation**: Render size của transition (bitmapA/B) nên tương ứng với encoder output (OUT_W/OUT_H). Nếu source có rotation, apply rotation trước khi render hoặc set appropriate transformations.
+
+---
+
+# Code mẫu — hàm tạo encoded transition samples (Kotlin)
+
+> Dưới đây là **hàm thực thi** bạn có thể dùng. Mình giữ nó tương đối đầy đủ (EGL + encoder + drain), có chú thích nơi cần import/tuỳ biến.
+
+```kotlin
+// Helper: drain encoder output into list of (ByteBuffer, BufferInfo)
+private fun drainEncoderToSamples(encoder: MediaCodec): MutableList<Pair<ByteBuffer, MediaCodec.BufferInfo>> {
+    val samples = mutableListOf<Pair<ByteBuffer, MediaCodec.BufferInfo>>()
+    val info = MediaCodec.BufferInfo()
+    while (true) {
+        val idx = encoder.dequeueOutputBuffer(info, 10_000)
+        if (idx >= 0) {
+            val outBuf = encoder.getOutputBuffer(idx)!!
+            val copy = ByteBuffer.allocateDirect(info.size)
+            outBuf.position(info.offset)
+            outBuf.limit(info.offset + info.size)
+            copy.put(outBuf)
+            copy.rewind()
+            // clone bufferInfo
+            val ci = MediaCodec.BufferInfo().apply {
+                set(info.offset, info.size, info.presentationTimeUs, info.flags)
+            }
+            samples += copy to ci
+            encoder.releaseOutputBuffer(idx, false)
+            if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+        } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+            // ignore; track format already known
+            Log.d(TAG, "encoder format changed: ${encoder.outputFormat}")
+        } else if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) {
+            // if we have already queued EOS and didn't get data, loop a bit more
+            Thread.yield()
+        }
+    }
+    return samples
+}
+
+/**
+ * Render transition by using encoder surface as render target.
+ * Returns list of encoded samples (with presentationTimeUs set).
+ */
+fun createEncodedTransitionSamples(
+    bmpA: Bitmap,
+    bmpB: Bitmap,
+    cfg: TransitionConfig,
+    encoderFormat: MediaFormat, // pre-configured with width/height/frame-rate/bitrate
+    basePtsUs: Long, // starting PTS for first transition frame (microseconds)
+    slideType: Int = 0
+): List<Pair<ByteBuffer, MediaCodec.BufferInfo>> {
+    // 1) create encoder
+    val mime = encoderFormat.getString(MediaFormat.KEY_MIME) ?: "video/avc"
+    val encoder = MediaCodec.createEncoderByType(mime)
+    encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+    val inputSurface = encoder.createInputSurface()
+    encoder.start()
+
+    // 2) create EGL on this surface and compile shader (reuse your SlideShader/TransitionRenderer)
+    val eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+    val ver = IntArray(2)
+    EGL14.eglInitialize(eglDisplay, ver, 0, ver, 1)
+    val attrib = intArrayOf(
+        EGL14.EGL_RED_SIZE, 8,
+        EGL14.EGL_GREEN_SIZE, 8,
+        EGL14.EGL_BLUE_SIZE, 8,
+        EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+        EGL14.EGL_NONE
+    )
+    val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
+    val num = IntArray(1)
+    EGL14.eglChooseConfig(eglDisplay, attrib, 0, configs, 0, 1, num, 0)
+    val cfgEgl = configs[0]!!
+    val ctxAttr = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
+    val eglContext = EGL14.eglCreateContext(eglDisplay, cfgEgl, EGL14.EGL_NO_CONTEXT, ctxAttr, 0)
+    val eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, cfgEgl, inputSurface, intArrayOf(EGL14.EGL_NONE), 0)
+    EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+
+    // use your SlideShader/TransitionRenderer draw path. Here assume you have SlideShader.draw(...)
+    SlideShader.ensureCompiled()
+
+    val steps = max(1, ((cfg.durationMs / 1000.0) * cfg.fps).toInt())
+    val frameDurUs = 1_000_000L / cfg.fps
+
+    // load textures into GL from bmpA and bmpB
+    fun loadTex(bmp: Bitmap): Int {
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1, ids, 0)
+        val tex = ids[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        return tex
+    }
+
+    val texA = loadTex(bmpA)
+    val texB = loadTex(bmpB)
+
+    for (i in 0 until steps) {
+        val weight = i.toFloat() / (steps - 1).coerceAtLeast(1)
+        GLES20.glViewport(0, 0, encoderFormat.getInteger(MediaFormat.KEY_WIDTH), encoderFormat.getInteger(MediaFormat.KEY_HEIGHT))
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+        SlideShader.draw(texA, texB, weight, cfg.initAlpha, cfg.targetAlpha, cfg.delayFraction, slideType, 0f, 1f, 1f, 0f)
+        val ptsUs = basePtsUs + i * frameDurUs
+        EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, ptsUs * 1000L) // ns
+        EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+    }
+
+    // mark EOS
+    encoder.signalEndOfInputStream()
+
+    // drain
+    val samples = drainEncoderToSamples(encoder)
+
+    // cleanup
+    GLES20.glDeleteTextures(2, intArrayOf(texA, texB), 0)
+    try {
+        EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+        EGL14.eglDestroySurface(eglDisplay, eglSurface)
+        EGL14.eglDestroyContext(eglDisplay, eglContext)
+        EGL14.eglTerminate(eglDisplay)
+    } catch (_: Throwable) {}
+    try { encoder.stop(); encoder.release() } catch (_: Throwable) {}
+
+    return samples
+}
+```
+
+> **Ghi chú:** `encoderFormat` cần set `KEY_FRAME_RATE`, `KEY_BIT_RATE`, `KEY_WIDTH`, `KEY_HEIGHT`, `KEY_COLOR_FORMAT` phù hợp. Bạn có thể reuse `format` được tạo trong `prepareTasks()` (tham chiếu `frequentTranscodingVO`) — tức là kích thước/bitrate phải trùng với track format mà `VideoTransfer` đang dùng.
+
+---
+
+# Nơi chèn gọi hàm này trong MotionScrap
+
+Trong `executeTasks` (thread B) có vòng:
+
+```kotlin
+while (targetTaskId < numTasks) {
+    if (mergeTasks.peek()?.id != targetTaskId) { cv.block(); ... continue }
+    val task = mergeTasks.poll()!!
+    if (task.isFromTranscoding()) {
+        videoTransfer.writeTrack(task.mpFile, task.getAllTranscodedSamples())
+    } else {
+        videoTransfer.writeTrack(task.mpFile)
+    }
+    targetTaskId++
+}
+```
+
+Bạn cần **chèn bước tạo transition** **trước** `mergeTasks.offer(nextFileTask)` trong nơi nào push tasks vào queue. Có hai chỗ thích hợp:
+
+* Nếu bạn want transitions between two *original/transferable* files (không transcode): generate transition after finishing writing current file in thread B **before** incrementing `targetTaskId` to next file — nhưng thread B không có access tới renderer/encoder tiện lợi (Thread A có thể làm tốt hơn).
+* **Ưu tiên**: tạo transition **trong Thread A** (nơi transcoding tasks được xử lý) ngay sau khi một `mergeTask` (nó) đã sẵn sàng — ví dụ, khi bạn `mergeTasks.add(VideoTransferringTask(current))` và bạn biết `next` file is available, thì tại đó gọi `createEncodedTransitionSamples(bmpA, bmpB, cfg, encoderFormat, basePtsUs)` rồi gói samples vào một `VideoTransferringTask` và `mergeTasks.add(transitionTask)`. Bởi vì Thread A có context để lấy first/last frames (mpFile), và dễ dàng truy cập video format info.
+
+Cụ thể, trong **các chỗ `mergeTasks.offer(VideoTransferringTask(it))`** (ở cuối loop khi xử lý transcodingTasks), bạn có thể:
+
+```kotlin
+// Pseudocode in Thread A after offering current task
+mergeTasks.offer(VideoTransferringTask(currentTask))
+// if next exists and transition required:
+val bmpA = extractFrame(currentTask.mpFile, fromEnd = true)
+val bmpB = extractFrame(nextTask.mpFile, fromEnd = false)
+val basePtsUs = currentLastTimestampUs + lastTransferredTimestampUs // compute appropriately
+val encoderFormat = // obtain from frequentTranscodingVO or trackInfos
+val samples = createEncodedTransitionSamples(bmpA, bmpB, cfg, encoderFormat, basePtsUs)
+val transitionTask = VideoTransferringTaskTransition(generateId(), transitionMpFile)
+transitionTask.addSamples("video/avc", samples)
+mergeTasks.offer(transitionTask)
+```
+
+`transitionMpFile` có thể là một `MPFile` giả (empty) hoặc `VideoTransferringTask` có property `samples` riêng — `VideoTransfer.writeTrack` hiện có overload `writeTrack(source: MPFile, samples: Map<String, List<Pair<ByteBuffer, BufferInfo>>>)` so bạn có thể use that signature directly: create a `VideoTransferringTask` with `mpFile` set to some object, and keep `samples` map accessible via `task.getAllTranscodedSamples()`.
+
+---
+
+# Ví dụ nhỏ: tạo transition và push vào queue (khoảng code để chèn vào Thread A)
+
+```kotlin
+// after adding current transfer task:
+mergeTasks.offer(VideoTransferringTask(current))
+
+// generate transition between current and next (if needed)
+if (index < inputFiles.size - 1) {
+    val nextMp = mpFiles[index + 1]
+    val bmpA = extractFrame(current.path(), fromEnd = true) // reuse existing helper
+    val bmpB = extractFrame(nextMp.path(), fromEnd = false)
+    val encoderFormat = // find the MediaFormat used for video track in VideoTransfer.trackInfos (width/height/frame-rate)
+    val basePtsUs = ptsOffsetUs // or compute lastTransferredTimestampUs + ptsOffset relative...
+    val samples = createEncodedTransitionSamples(bmpA, bmpB, cfg, encoderFormat, basePtsUs)
+    // build a helper task that returns these samples via getAllTranscodedSamples()
+    val transitionTask = object : VideoTransferringTask(generateTransitionId(), MPFile(File("TRANSITION_${index}"))) {
+        init {
+            addSamples(MimeType.VIDEO_AVC.value, samples)
+        }
+        override fun isFromTranscoding() = true // so writeTrack will use samples map
+    }
+    mergeTasks.offer(transitionTask)
+}
+```
+
+> **generateTransitionId()**: phải đảm bảo id tăng tuần tự sao cho Thread B sẽ thấy `mergeTasks.peek().id == targetTaskId` đúng vị trí. (Bạn có thể assign id = current.id + 1 and shift subsequent ids accordingly — nhưng dễ nhất là chèn transition task ngay lúc build task list ban đầu để id ordering ổn.)
+
+---
+
+# Progress / Tracking
+
+* Khi `VideoTransfer.writeTrack` đang loop `for ((buf, bufferInfo) in data) { ... eventListener?.onEachFrameTransferred(source, mimeType, bufferInfo) }`, bạn đã tự nhiên báo progress cho mỗi frame. Khi tạo transition samples, hãy chắc chắn gọi `eventListener` conformance: `VideoTransferringTask` chứa `mpFile` (transition MPFile). `eventListener.onEachFrameTransferred(transitionMpFile, "video/avc", bufferInfo)` sẽ được gọi khi write->muxer thực thi. Vì `ProgressTracker` dùng presentationTimeUs, frame count... chúng sẽ được cập nhật bởi các bufferInfo bạn tạo.
+
+---
+
+# Những thay đổi code nhỏ cần thực hiện trong dự án
+
+1. **Thêm utility `createEncodedTransitionSamples(...)`** (mã như trên) vào module encode/merge utility.
+2. **Bổ sung một dạng `VideoTransferringTask` cho transition** hoặc cho phép `VideoTransferringTask` khởi tạo với `samples` đã có.
+3. **Khi build `mergeTasks` (trong `prepareTasks()` hoặc khi transcoding hoàn thành)**: tạo transitionTask giữa files phù hợp và `offer()` vào `mergeTasks` ở đúng vị trí id.
+4. **Đảm bảo `VideoTransfer` trackFormats chứa video track format tương thích** (tham khảo `prepareTasks()` — bạn đã add track formats rồi).
+5. **Test cẩn thận**:
+
+   * phát file ra để check SPS/PPS, timestamps liên tục không bị overlap.
+   * kiểm tra trường hợp audio track (transition video chỉ chứa video track; audio behavior: bạn có thể insert silent audio OR crossfade audio separately). Nếu muốn crossfade audio, phải encode audio transition chunk và insert as audio samples too.
+
+---
+
+# Audio transitions (option)
+
+* Nếu muốn fade audio giữa clips, tạo AAC-encoded audio samples tương ứng (sine zeros or fade samples) và add vào samples map with key `audio/aac` cùng timestamps tương ứng.
+* MotionScrap có `makeSilentAudioTrack(...)` pattern — bạn có thể reuse/extend để tạo fade-in/out audio chunk.
+
+---
+
+# Ví dụ ngắn gọn về một class `TransitionTask` (skeleton)
+
+```kotlin
+class TransitionTransferringTask(id: Int, val samplesMap: Map<String, List<Pair<ByteBuffer, MediaCodec.BufferInfo>>>) : VideoTransferringTask(id, MPFile(File("transition_$id"))) {
+    override fun isFromTranscoding(): Boolean = true
+    override fun getAllTranscodedSamples(): Map<String, List<Pair<ByteBuffer, MediaCodec.BufferInfo>>> {
+        return samplesMap
+    }
+}
+```
+
+Rồi `mergeTasks.offer(TransitionTransferringTask(nextId, mapOf(MimeType.VIDEO_AVC.value to samples)))`.
+
+---
+
+# Checklist test & debug
+
+* [ ] Track format used by VideoTransfer includes `csd-0/csd-1` (SPS/PPS). Nếu không, phải inject them before muxer.start().
+* [ ] Timestamps: ensure `presentationTimeUs` of transition frames start at `lastTransferredTimestampUs` and strictly increasing.
+* [ ] Ensure transition frames' resolution matches muxer track format.
+* [ ] Drop `BUFFER_FLAG_CODEC_CONFIG` when writing sample via `VideoTransfer` if track format already contains csd; code already does skip codec-config.
+* [ ] Stress test: many transitions, ensure memory freed (ByteBuffer.rewind()/clear()) and textures deleted.
+
+---
+
+# Kết luận ngắn
+
+* **Bạn nên tạo transition như một `VideoTransferringTask` chứa encoded samples**, và `offer()` task đó vào `mergeTasks` giữa hai file tương ứng.
+* **Sử dụng encoder+EGL renderer (TransitionRenderer/SlideShader)** để render frames + drain encoder thành NALs; kết quả push vào `VideoTransfer`.
+* Đoạn code `createEncodedTransitionSamples(...)` mình cung cấp là phần lõi — chèn vào nơi phù hợp (nơi build/push mergeTasks) là xong.
+* Nếu bạn muốn, mình có thể:
+
+  1. Viết **bản patch hoàn chỉnh** chèn `createEncodedTransitionSamples` và `TransitionTransferringTask` vào code của bạn, hoặc
+  2. Cập nhật chính xác **vị trí trong `prepareTasks()` hoặc chỗ `mergeTasks.offer(...)`** để chèn transition (mình sẽ sửa file thực tế nếu bạn gửi đường dẫn/patch).
+
+Muốn mình tiếp tục với phương án nào?
+
+* A: “Viết patch đầy đủ chèn transition vào `prepareTasks`/`executeTasks`”
+* B: “Gửi full helper + ví dụ chèn vào chỗ cụ thể trong file `MotionScrap` (dòng X..Y)”
+
+Chọn A hoặc B (mình sẽ tiếp tục và dán code hoàn chỉnh bạn có thể dán vào repo).
