@@ -1,0 +1,1120 @@
+package com.seanghay.fadein.gles.egl
+
+import android.graphics.SurfaceTexture
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
+import android.util.Log
+import android.view.Surface
+
+class EglCore(
+  private val sharedContext: EGLContext = EGL14.EGL_NO_CONTEXT,
+  private val flags: Int = 0
+) {
+
+    private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
+    private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
+    private var eglConfig: EGLConfig? = null
+    private var glVersion = -1
+
+    fun setup() {
+        rationalChecks()
+        getDisplay()
+        initializeEgl()
+        tryGles3Context()
+        tryFallbackContext()
+        Log.d(TAG, "EGLContext created, client version: ${getClientVersion()}")
+        logCurrent("Setup completed")
+    }
+
+    private fun getClientVersion(): Int {
+        val values = IntArray(1)
+        EGL14.eglQueryContext(eglDisplay, eglContext, EGL14.EGL_CONTEXT_CLIENT_VERSION, values, 0)
+        return values[0]
+    }
+
+    private fun tryFallbackContext() {
+        if (eglContext == EGL14.EGL_NO_CONTEXT) {
+            val config = getConfig(flags, 2) ?: fail("Unable to find a suitable EGLConfig")
+            val attribute2List = intArrayOf(
+                EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
+                EGL14.EGL_NONE
+            )
+            val context = runs {
+                EGL14.eglCreateContext(eglDisplay, config, sharedContext, attribute2List, 0)
+            }
+
+            eglConfig = config
+            eglContext = context
+            glVersion = 2
+        }
+    }
+
+    private fun tryGles3Context() {
+        if (flags and FLAG_GLES3 != 0) {
+            getConfig(flags, 3)?.let { config ->
+                val attribute3List = intArrayOf(
+                    EGL14.EGL_CONTEXT_CLIENT_VERSION, 3,
+                    EGL14.EGL_NONE
+                )
+
+                val context =
+                    EGL14.eglCreateContext(eglDisplay, config, sharedContext, attribute3List, 0)
+
+                if (EGL14.eglGetError() == EGL14.EGL_SUCCESS) {
+                    eglConfig = config
+                    eglContext = context
+                    glVersion = 3
+                }
+            }
+        }
+    }
+
+    private fun initializeEgl() {
+        val version = IntArray(2)
+        if (!EGL14.eglInitialize(eglDisplay, version, 0, version, 1)) {
+            eglDisplay = EGL14.EGL_NO_DISPLAY
+            fail("unable to initialize EGL14")
+        }
+    }
+
+    private fun getDisplay() {
+        eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        if (eglDisplay == EGL14.EGL_NO_DISPLAY) fail("unable to get EGL14 display")
+    }
+
+    private fun rationalChecks() {
+        if (eglDisplay != EGL14.EGL_NO_DISPLAY) fail("EGL display already setup!")
+    }
+
+    fun getConfig(flags: Int, version: Int): EGLConfig? {
+        val renderableType = if (version >= 3) EGLExt.EGL_OPENGL_ES3_BIT_KHR
+        else EGL14.EGL_OPENGL_ES2_BIT
+
+        val attributesList = intArrayOf(
+            EGL14.EGL_RED_SIZE, 8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_ALPHA_SIZE, 8,
+            // EGL14.EGL_DEPTH_SIZE, 16,
+            // EGL14.EGL_STENCIL_SIZE, 8,
+            EGL14.EGL_RENDERABLE_TYPE, renderableType,
+            EGL14.EGL_NONE, 0, // placeholder for recordable [@-3]
+            EGL14.EGL_NONE
+        )
+
+        if (flags and FLAG_RECORDABLE != 0) {
+            attributesList[attributesList.size - 3] =
+                EGL_RECORDABLE_ANDROID
+            attributesList[attributesList.size - 2] = 1
+        }
+
+        val configs = arrayOfNulls<EGLConfig>(1)
+        val numConfigs = IntArray(1)
+
+        if (!EGL14.eglChooseConfig(
+                eglDisplay, attributesList, 0, configs,
+                0, configs.size, numConfigs, 0
+            )
+        ) {
+            Log.w(TAG, "unable to find RGB8888 / $version EGLConfig")
+            return null
+        }
+
+        return configs[0]
+    }
+
+    fun release() {
+        if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+            EGL14.eglMakeCurrent(
+                eglDisplay,
+                EGL14.EGL_NO_SURFACE,
+                EGL14.EGL_NO_SURFACE,
+                EGL14.EGL_NO_CONTEXT
+            )
+            EGL14.eglDestroyContext(eglDisplay, eglContext)
+            EGL14.eglReleaseThread()
+            EGL14.eglTerminate(eglDisplay)
+        }
+
+        eglDisplay = EGL14.EGL_NO_DISPLAY
+        eglContext = EGL14.EGL_NO_CONTEXT
+        eglConfig = null
+    }
+
+    protected fun finalize() {
+        try {
+            if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                Log.w(TAG, "WARNING: EglCore was not explicitly released -- state may be leaked")
+                release()
+            }
+        } catch (err: Exception) {
+            err.printStackTrace()
+            fail("Error while finalized by GC")
+        }
+    }
+
+    fun releaseSurface(eglSurface: EGLSurface) {
+        EGL14.eglDestroySurface(eglDisplay, eglSurface)
+    }
+
+    fun createWindowSurface(surface: Any?): EGLSurface {
+        if (surface !is Surface && surface !is SurfaceTexture) {
+            fail("Invalid surface: $surface")
+        }
+
+        val surfaceAttributes = intArrayOf(
+            EGL14.EGL_NONE
+        )
+
+        return runs("eglCreateWindowSurface") {
+            EGL14.eglCreateWindowSurface(eglDisplay, eglConfig, surface, surfaceAttributes, 0)
+                ?: fail("Surface was null")
+        }
+    }
+
+    fun createOffscreenSurface(width: Int, height: Int): EGLSurface {
+        val surfaceAttributes = intArrayOf(
+            EGL14.EGL_WIDTH, width,
+            EGL14.EGL_HEIGHT, height,
+            EGL14.EGL_NONE
+        )
+
+        return runs("Create offscreen surface") {
+            EGL14.eglCreatePbufferSurface(eglDisplay, eglConfig, surfaceAttributes, 0)
+                ?: fail("Surface was null")
+        }
+    }
+
+    fun makeCurrent(eglSurface: EGLSurface) {
+        if (eglDisplay == EGL14.EGL_NO_DISPLAY) {
+            Log.d(TAG, "NOTE: Make current without display")
+        }
+
+        if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+            fail("eglMakeCurrent failed")
+        }
+    }
+
+    fun makeCurrent(drawSurface: EGLSurface, readSurface: EGLSurface) {
+        if (eglDisplay == EGL14.EGL_NO_DISPLAY) Log.d(TAG, "NOTE: Make current without display")
+        if (!EGL14.eglMakeCurrent(eglDisplay, drawSurface, readSurface, eglContext))
+            fail("eglMakeCurrent failed")
+    }
+
+    fun destroyCurrent() {
+        if (!EGL14.eglMakeCurrent(
+                eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE,
+                EGL14.EGL_NO_CONTEXT
+            )
+        ) {
+            fail("eglMakeCurrent failed")
+        }
+    }
+
+    fun swapBuffers(eglSurface: EGLSurface): Boolean {
+        return EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+    }
+
+    fun setPresentationTime(eglSurface: EGLSurface, nsecs: Long) {
+        EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, nsecs)
+    }
+
+    fun isCurrent(eglSurface: EGLSurface): Boolean {
+        return eglContext == EGL14.eglGetCurrentContext() &&
+                eglSurface == EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+    }
+
+    fun querySurface(eglSurface: EGLSurface, name: Int): Int {
+        val value = IntArray(1)
+        EGL14.eglQuerySurface(eglDisplay, eglSurface, name, value, 0)
+        return value[0]
+    }
+
+    fun queryString(name: Int): String {
+        return EGL14.eglQueryString(eglDisplay, name)
+    }
+
+    fun getGlesVersion(): Int {
+        return glVersion
+    }
+
+    companion object {
+        private const val TAG = "EglCore"
+        const val FLAG_RECORDABLE = 0x01
+        const val FLAG_GLES3 = 0x02
+        const val EGL_RECORDABLE_ANDROID = 0x3142
+
+        fun <T> runs(
+          message: String? = "",
+          block: (() -> T)
+        ): T {
+            return block().also {
+                val error = EGL14.eglGetError()
+                if (error != EGL14.EGL_SUCCESS) {
+                    throw RuntimeException("$message: EGL error 0x${error.toString(16)}")
+                }
+            }
+        }
+
+        fun fail(message: String): Nothing {
+            throw RuntimeException("EglCore: $message")
+        }
+
+        fun logCurrent(message: String) {
+            val display = EGL14.eglGetCurrentDisplay()
+            val context = EGL14.eglGetCurrentContext()
+            val surface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+
+            Log.i(
+                TAG, "Current EGL (" + message + "): display=" + display + ", context=" + context +
+                        ", surface=" + surface
+            )
+        }
+    }
+}
+
+package com.seanghay.fadein.gles.egl
+
+import android.opengl.EGL14
+import android.opengl.GLES20
+
+inline fun <T> glScope(message: String = "", block: (() -> T)): T {
+    return block().also {
+        var error: Int = GLES20.glGetError()
+        while (error != GLES20.GL_NO_ERROR) {
+            val errorMessage = error
+            error = GLES20.glGetError()
+            throw RuntimeException("GL Error: $message\n 0x${errorMessage.toString(16)}")
+        }
+    }
+}
+
+inline fun <T> eglScope(message: String = "", block: (() -> T)): T {
+    return block().also {
+        val error = EGL14.eglGetError()
+        if (error != EGL14.EGL_SUCCESS) {
+            throw RuntimeException("$message: EGL Error: 0x${error.toString(16)}")
+        }
+    }
+}
+package com.seanghay.fadein.gles.egl
+
+import android.graphics.Bitmap
+import android.opengl.EGL14
+import android.opengl.EGLSurface
+import android.opengl.GLES20
+import android.util.Log
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+open class EglSurfaceBase(protected var eglCore: EglCore) {
+
+    private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+    private var width: Int = -1
+    private var height: Int = -1
+
+    private fun checkRationals() {
+        if (eglSurface != EGL14.EGL_NO_SURFACE) fail("surface already created")
+    }
+
+    open fun createWindowSurface(surface: Any?) {
+        checkRationals()
+        eglSurface = eglCore.createWindowSurface(surface)
+    }
+
+    open fun createOffscreenSurface(width: Int, height: Int) {
+        checkRationals()
+        eglSurface = eglCore.createOffscreenSurface(width, height)
+        this.width = width
+        this.height = height
+    }
+
+    fun width(): Int {
+        return if (width < 0) eglCore.querySurface(eglSurface, EGL14.EGL_WIDTH)
+        else width
+    }
+
+    fun height(): Int {
+        return if (height < 0) eglCore.querySurface(eglSurface, EGL14.EGL_HEIGHT)
+        else height
+    }
+
+    open fun releaseEglSurface() {
+        eglCore.releaseSurface(eglSurface)
+        eglSurface = EGL14.EGL_NO_SURFACE
+        width = -1
+        height = -1
+    }
+
+    open fun makeCurrent() {
+        eglCore.makeCurrent(eglSurface)
+    }
+
+    open fun makeCurrentReadFrom(readSurface: EglSurfaceBase) {
+        eglCore.makeCurrent(eglSurface, readSurface.eglSurface)
+    }
+
+    open fun swapBuffers(): Boolean {
+        return eglCore.swapBuffers(eglSurface).also {
+            if (!it)
+                Log.d(TAG, "WARNING: swapBuffers() failed")
+        }
+    }
+
+    open fun setPresentationTime(nsecs: Long) {
+        eglCore.setPresentationTime(eglSurface, nsecs)
+    }
+
+    @Throws(IOException::class)
+    fun saveFrame(file: File) {
+        if (!eglCore.isCurrent(eglSurface)) fail("Expected EGL Context/Surface is not current")
+        val filename = file.toString()
+        val width = width()
+        val height = height()
+        val buffer = ByteBuffer.allocate(width * height * 4)
+        buffer.order(ByteOrder.LITTLE_ENDIAN)
+        glScope {
+            GLES20.glReadPixels(
+                0, 0, width, height,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer
+            )
+        }
+
+        buffer.rewind()
+
+        BufferedOutputStream(FileOutputStream(filename)).use {
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+                copyPixelsFromBuffer(buffer)
+                compress(Bitmap.CompressFormat.PNG, 90, it)
+                recycle()
+            }
+        }
+
+        Log.d(TAG, "Saved " + width + "x" + height + " frame as '" + filename + "'")
+    }
+
+    companion object {
+        private const val TAG = "EglSurfaceBase"
+
+        private fun fail(message: String): Nothing {
+            throw RuntimeException("EglSurfaceBase: $message")
+        }
+    }
+}
+
+
+package com.seanghay.studio.gles.graphics.texture
+
+import android.graphics.Bitmap
+import android.opengl.GLUtils
+
+class BitmapTextureUniform(
+  name: String,
+  private val bitmap: Bitmap,
+  texture2d: Texture2d = Texture2d()
+) : Texture2dUniform(name, texture2d) {
+
+    override fun configure() {
+        super.configure()
+        GLUtils.texImage2D(textureTarget, 0, bitmap, 0)
+    }
+}
+
+package com.seanghay.studio.gles.graphics.texture
+
+import android.opengl.GLES20
+import com.seanghay.studio.gles.annotation.GlContext
+
+open class Texture(var id: Int = NO_TEXTURE) {
+
+    @GlContext
+    open fun initialize(force: Boolean = false) {
+        if (id == NO_TEXTURE || force) {
+            createTexture()
+        }
+    }
+
+    @GlContext
+    open fun createTexture() {
+        val args = IntArray(1)
+        GLES20.glGenTextures(args.size, args, 0)
+        id = args[0]
+    }
+
+    @GlContext
+    open fun enable(textureTarget: Int) {
+        GLES20.glBindTexture(textureTarget, id)
+    }
+
+    @GlContext
+    open fun disable(textureTarget: Int) {
+        GLES20.glBindTexture(textureTarget, 0)
+    }
+
+    inline fun use(textureTarget: Int, block: () -> Unit) {
+        enable(textureTarget)
+        block()
+        disable(textureTarget)
+    }
+
+    fun release() {
+        if (id == NO_TEXTURE) return
+        val args = intArrayOf(id)
+        GLES20.glDeleteTextures(1, args, 0)
+    }
+
+    companion object {
+        const val NO_TEXTURE = -1
+    }
+}
+
+package com.seanghay.studio.gles.graphics.uniform
+
+import android.opengl.GLES20
+
+class BooleanUniform(name: String) : Uniform<Boolean>(name) {
+
+    override fun loadLocation(): Int {
+        return GLES20.glGetUniformLocation(program, name)
+    }
+
+    override fun rationalChecks() {
+        if (program == -1) throw RuntimeException("Invalid program")
+        if (_location == -1 && !isOptional)
+            throw RuntimeException("Uniform name: $name is not found! Did you Initialize it yet?")
+    }
+
+    override fun setValue(value: Boolean) {
+        GLES20.glUniform1i(_location, if (value) 1 else 0)
+        cachedValue = value
+    }
+
+    override fun getValue(): Boolean {
+        val args = IntArray(1)
+        GLES20.glGetUniformiv(program, _location, args, 0)
+        return args[0] != 0
+    }
+}
+package com.seanghay.studio.gles.graphics.uniform
+
+import com.seanghay.studio.gles.graphics.Vector2f
+import android.opengl.GLES20
+
+class Float2Uniform(name: String) : Uniform<Vector2f>(name) {
+
+    override fun loadLocation(): Int {
+        return GLES20.glGetUniformLocation(program, name)
+    }
+
+    override fun rationalChecks() {
+        if (program == -1) throw RuntimeException("Invalid program")
+        if (_location == -1 && !isOptional)
+            throw RuntimeException("Uniform name: $name is not found! Did you Initialize it yet?")
+    }
+
+    override fun setValue(value: Vector2f) {
+        GLES20.glUniform2f(_location, value.x, value.y)
+        cachedValue = value
+    }
+
+    override fun getValue(): Vector2f {
+        return cachedValue()
+    }
+}
+package com.seanghay.studio.gles.graphics.uniform
+
+import android.opengl.GLES20
+
+class FloatUniform(name: String) : Uniform<Float>(name) {
+
+    override fun loadLocation(): Int {
+        return GLES20.glGetUniformLocation(program, name)
+    }
+
+    override fun rationalChecks() {
+        if (program == -1) throw RuntimeException("Invalid program")
+        if (_location == -1 && !isOptional)
+            throw RuntimeException("Uniform name: $name is not found! Did you Initialize it yet?")
+    }
+
+    override fun setValue(value: Float) {
+        GLES20.glUniform1f(_location, value)
+        cachedValue = value
+    }
+
+    override fun getValue(): Float {
+        val args = FloatArray(1)
+        GLES20.glGetUniformfv(program, _location, args, 0)
+        return args[0]
+    }
+}
+
+fun uniform1f(name: String) = FloatUniform(name)
+package com.seanghay.studio.gles.graphics.uniform
+
+import android.opengl.GLES20
+
+class IntUniform(name: String) : Uniform<Int>(name) {
+
+    override fun loadLocation(): Int {
+        return GLES20.glGetUniformLocation(program, name)
+    }
+
+    override fun rationalChecks() {
+        if (program == -1) throw RuntimeException("Invalid program")
+        if (_location == -1 && !isOptional)
+            throw RuntimeException("Uniform name: $name is not found! Did you Initialize it yet?")
+    }
+
+    override fun setValue(value: Int) {
+        GLES20.glUniform1i(_location, value)
+        cachedValue = value
+    }
+
+    override fun getValue(): Int {
+        val args = IntArray(1)
+        GLES20.glGetUniformiv(program, _location, args, 0)
+        return args[0]
+    }
+}
+package com.seanghay.studio.gles.graphics.uniform
+
+import com.seanghay.studio.gles.graphics.Matrix4f
+import android.opengl.GLES20
+
+class Mat4Uniform(name: String) : Uniform<Matrix4f>(name) {
+
+    override fun loadLocation(): Int {
+        return GLES20.glGetUniformLocation(program, name)
+    }
+
+    override fun rationalChecks() {
+        if (program == -1) throw RuntimeException("Invalid program")
+        if (_location == -1 && !isOptional)
+            throw RuntimeException("Uniform name: $name is not found! Did you Initialize it yet?")
+    }
+
+    override fun setValue(value: Matrix4f) {
+        GLES20.glUniformMatrix4fv(_location, 1, false, value.elements, 0)
+        cachedValue = value
+    }
+
+    override fun getValue(): Matrix4f {
+        // Not implemented readback
+        return cachedValue()
+    }
+}
+
+fun uniform1i(name: String) = com.seanghay.studio.gles.graphics.uniform.IntUniform(name)
+fun uniform2f(name: String) = com.seanghay.studio.gles.graphics.uniform.Float2Uniform(name)
+
+
+package com.seanghay.studio.gles.graphics.uniform
+
+import android.opengl.GLES20
+import com.seanghay.studio.gles.graphics.InputValue
+
+abstract class Uniform<T>(name: String) : InputValue<T>(name) {
+
+    // Sometimes, uniforms don't need to be existed.
+    var isOptional = false
+
+    override fun loadLocation(): Int {
+        return GLES20.glGetUniformLocation(program, name)
+    }
+
+    override fun rationalChecks() {
+        if (program == -1) throw RuntimeException("Invalid program")
+        if (_location == -1 && !isOptional)
+            throw RuntimeException("Uniform name: $name is not found! Did you Initialize it yet?")
+    }
+}
+
+package com.seanghay.fadein.gles.graphics
+
+import com.seanghay.fadein.gles.annotation.GlContext
+
+abstract class InputValue<T>(var name: String) {
+
+    protected var cachedValue: T? = null
+    protected var program: Int = -1
+    protected var _location: Int = -1
+
+    protected abstract fun loadLocation(): Int
+
+    @GlContext
+    @Throws(RuntimeException::class)
+    open fun initialize(p: Int) {
+        if (p == -1) throw RuntimeException("Invalid program")
+        this.program = p
+
+        _location = loadLocation()
+        rationalChecks()
+    }
+
+    @Throws(RuntimeException::class)
+    protected abstract fun rationalChecks()
+
+    @GlContext
+    abstract fun setValue(value: T)
+
+    @GlContext
+    abstract fun getValue(): T
+
+    @Throws(RuntimeException::class)
+    fun getLocation(): Int {
+        rationalChecks()
+        return _location
+    }
+
+    fun cachedValue(): T = cachedValue ?: throw RuntimeException("cachedValue was null")
+}
+
+
+package com.seanghay.fadein.gles.graphics
+
+import android.opengl.Matrix
+
+fun mat4(elements: FloatArray) = Matrix4f(elements)
+fun mat4() = Matrix4f()
+
+data class Matrix4f(var elements: FloatArray = FloatArray(4 * 4)) :
+    Iterator<Float> by elements.iterator() {
+
+    init {
+        Matrix.setIdentityM(elements, 0)
+    }
+
+    operator fun get(index: Int) = elements[index]
+
+    operator fun set(index: Int, value: Float) {
+        elements[index] = value
+    }
+
+    operator fun times(mat4: Matrix4f): Matrix4f {
+        val result = Matrix4f()
+        Matrix.multiplyMM(
+            result.elements, 0, elements,
+            0, mat4.elements, 0
+        )
+        return result
+    }
+}
+package com.seanghay.studio.gles.graphics
+
+data class Vector2f(var x: Float = 0f, var y: Float = 0f)
+
+
+package com.seanghay.fadein.gles.shader
+
+import android.opengl.Matrix
+import com.seanghay.fadein.gles.graphics.Matrix4f
+import com.seanghay.fadein.gles.graphics.uniform.uniform1f
+
+open class AlphaOverlayTextureShader :
+    TextureShader(fragmentShaderSource = OVERLAY_FRAGMENT_SHADER) {
+
+    open var alpha: Float = 1f
+    open var scaleX = 1f
+    open var scaleY = 1f
+    open var translateX = 0f
+    open var translateY = 0f
+    open var rotation = 0f
+
+    open var alphaUniform = uniform1f(ALPHA_UNIFORM).autoInit()
+
+    private val scaleMatrix = FloatArray(16)
+    private val rotationMatrix = FloatArray(16)
+    private val translateMatrix = FloatArray(16)
+
+    private fun setIdentities() {
+        Matrix.setIdentityM(scaleMatrix, 0)
+        Matrix.setIdentityM(rotationMatrix, 0)
+        Matrix.setIdentityM(translateMatrix, 0)
+    }
+
+    open fun setMatrix(matrix: Matrix4f) {
+        this.mvpMatrix.elements = matrix.elements.clone()
+
+        setIdentities()
+        Matrix.translateM(translateMatrix, 0, translateX, translateY, 0f)
+        Matrix.multiplyMM(
+            mvpMatrix.elements, 0, mvpMatrix.elements, 0,
+            translateMatrix, 0
+        )
+    }
+
+    override fun writeUniforms() {
+        super.writeUniforms()
+        alphaUniform.setValue(alpha)
+    }
+
+    companion object {
+
+        // language=string
+        private const val ALPHA_UNIFORM = "alpha"
+
+        // language=glsl
+        @JvmStatic
+        private val OVERLAY_FRAGMENT_SHADER = """
+            precision mediump float;
+            uniform sampler2D texture;
+            uniform float $ALPHA_UNIFORM;
+            varying vec2 texCoord;
+
+            void main() {
+                vec4 textureColor = texture2D(texture, texCoord);
+                gl_FragColor = mix(vec4(0.0), textureColor, $ALPHA_UNIFORM);
+            }
+        """.trimIndent()
+    }
+}
+
+package com.seanghay.fadein.gles.shader
+
+import android.graphics.Bitmap
+import com.seanghay.fadein.gles.graphics.texture.BitmapTextureUniform
+import com.seanghay.fadein.gles.graphics.texture.Texture2dUniform
+
+open class ImageTextureShader(var bitmap: Bitmap) : TextureShader() {
+
+    var texture2d: Texture2dUniform = BitmapTextureUniform("texture", bitmap).autoInit()
+
+    open fun draw() {
+        draw(texture2d.texture)
+    }
+}
+
+package com.seanghay.fadein.gles.shader
+
+import android.opengl.GLES20.glDeleteProgram
+import android.opengl.GLES20.glDetachShader
+import android.opengl.GLES20.glUseProgram
+import com.seanghay.fadein.gles.egl.glScope
+import com.seanghay.fadein.gles.graphics.InputValue
+import com.seanghay.fadein.utils.GlUtils
+
+abstract class Shader {
+
+    abstract var vertexShaderSource: String
+
+    abstract var fragmentShaderSource: String
+
+    var fragmentShader: Int = -1
+        protected set
+
+    var vertexShader: Int = -1
+        protected set
+
+    var program: Int = -1
+        protected set
+
+    var isProgramCreated = false
+        protected set
+
+    var inputValues = mutableListOf<InputValue<*>>()
+        protected set
+
+    abstract fun onCreate()
+
+    protected fun <T : InputValue<*>> T.autoInit(): T {
+        inputValues.add(this)
+        return this
+    }
+
+    protected open fun loadFragmentShaderSource(): String {
+        return fragmentShaderSource
+    }
+
+    protected fun createProgram() {
+        val shaderInfo =
+            GlUtils.createProgramWithShaders(vertexShaderSource, loadFragmentShaderSource())
+        fragmentShader = shaderInfo.fragmentShader
+        vertexShader = shaderInfo.vertexShader
+        program = shaderInfo.program
+        isProgramCreated = true
+    }
+
+    protected fun isValidProgram(): Boolean = program != -1
+
+    protected fun validateProgram() {
+        if (!isValidProgram() || !isProgramCreated) {
+            throw RuntimeException("Program is invalid!")
+        }
+    }
+
+    protected open fun enable() {
+        validateProgram()
+        glUseProgram(program)
+    }
+
+    protected open fun disable() {
+        glUseProgram(0)
+    }
+
+    protected open fun initializeInputValues() {
+        for (input in inputValues) {
+            input.initialize(program)
+        }
+    }
+
+    open fun setup() {
+        createProgram()
+        initializeInputValues()
+        onCreate()
+    }
+
+    open fun trySetup(): Boolean {
+        if (isProgramCreated) return false
+        setup()
+        return true
+    }
+
+    fun releaseShaders() = glScope {
+        glDetachShader(program, vertexShader)
+        glDetachShader(program, fragmentShader)
+    }
+
+    fun releaseProgram() = glScope {
+        releaseShaders()
+        glDeleteProgram(program)
+        isProgramCreated = false
+        program = -1
+    }
+
+    open fun release() = glScope {
+        releaseProgram()
+    }
+
+    fun use(block: () -> Unit) {
+        enable()
+        block()
+        disable()
+    }
+}
+package com.seanghay.fadein.gles.shader
+
+import android.opengl.GLES20
+import com.seanghay.fadein.gles.graphics.Matrix4f
+import com.seanghay.fadein.gles.graphics.attribute.VertexAttribute
+import com.seanghay.fadein.gles.graphics.mat4
+import com.seanghay.fadein.gles.graphics.texture.Texture
+import com.seanghay.fadein.gles.graphics.uniform.BooleanUniform
+import com.seanghay.fadein.gles.graphics.uniform.Mat4Uniform
+import com.seanghay.fadein.gles.graphics.uniform.uniform1f
+import com.seanghay.fadein.gles.graphics.uniform.uniform1i
+import com.seanghay.fadein.gles.graphics.uniform.uniform2f
+import com.seanghay.fadein.gles.graphics.vec2
+import com.seanghay.fadein.utils.BasicVertices
+
+open class TextureShader(
+  override var vertexShaderSource: String = VERTEX_SHADER,
+  override var fragmentShaderSource: String = FRAGMENT_SHADER,
+  var coords: FloatArray = BasicVertices.FULL_RECTANGLE
+) : Shader() {
+
+    var hasExternalTexture = false
+
+    var isFlipVertical: Boolean = false
+    var isFlipHorizontal: Boolean = false
+    var mvpMatrix: Matrix4f = mat4()
+
+    // Default to square ratio 1:1
+    var ratio: Float = 1.0f
+
+    // Viewport
+    var resolution = vec2(0f, 0f)
+
+    open var textureCoordinateAttr = VertexAttribute(
+        "vTextureCoordinate",
+        BasicVertices.NORMAL_TEXTURE_COORDINATES, 2
+    ).autoInit()
+
+    open var positionAttr = VertexAttribute(
+        "vPosition",
+        coords, 3
+    ).autoInit()
+        protected set
+
+    open var flipVerticalUniform = BooleanUniform("flipY").autoInit()
+        protected set
+
+    open var flipHorizontalUniform = BooleanUniform("flipX").autoInit()
+        protected set
+
+    open var mvpMatrixUniform = Mat4Uniform("mvpMatrix").autoInit()
+        protected set
+
+    open var ratioUniform = uniform1f("ratio")
+        .also { it.isOptional = true }
+        .autoInit()
+
+    open var resolutionUniform = uniform2f("resolution")
+        .also { it.isOptional = true }
+        .autoInit()
+
+    open var textureUniform = uniform1i("texture").autoInit()
+
+    override fun loadFragmentShaderSource(): String {
+        return transformFragmentShader(fragmentShaderSource)
+    }
+
+    // Noop
+    override fun onCreate() {}
+
+    open fun beforeDraw() {}
+    open fun afterDraw() {}
+    open fun beforeDrawVertices() {}
+    open fun afterDrawVertices() {}
+
+    protected open fun writeUniforms() {
+        flipVerticalUniform.setValue(isFlipVertical)
+        flipHorizontalUniform.setValue(isFlipHorizontal)
+        mvpMatrixUniform.setValue(mvpMatrix)
+        ratioUniform.setValue(ratio)
+        resolutionUniform.setValue(resolution)
+        textureUniform.setValue(5)
+    }
+
+    open fun setResolution(width: Float, height: Float) {
+        resolution.x = width
+        resolution.y = height
+    }
+
+    open fun draw(texture: Texture) = use {
+        positionAttr.use {
+            beforeDraw()
+            textureCoordinateAttr.use {
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE5)
+                texture.use(GLES20.GL_TEXTURE_2D) {
+                    writeUniforms()
+                    beforeDrawVertices()
+                    drawArrays()
+                    afterDrawVertices()
+                }
+            }
+
+            afterDraw()
+        }
+    }
+
+    fun transformFragmentShader(frag: String): String {
+        var str = frag
+        if (hasExternalTexture) {
+            str = "#extension GL_OES_EGL_image_external : require\n$str"
+                .replace("sampler2D", "samplerExternalOES")
+        }
+        return str
+    }
+
+    companion object {
+
+        // language=glsl
+        const val VERTEX_SHADER = """
+            attribute vec4 vPosition;
+            attribute vec2 vTextureCoordinate;
+
+            varying vec2 texCoord;
+
+            uniform mat4 mvpMatrix;
+            uniform bool flipY;
+            uniform bool flipX;
+            uniform float ratio;
+
+            void main() {
+                gl_Position = mvpMatrix * vPosition;
+                texCoord = vTextureCoordinate;
+
+                if (flipY) {
+                    texCoord.y = 1.0 - texCoord.y;
+                }
+
+                if (flipX) {
+                    texCoord.x = 1.0 - texCoord.x;
+                }
+            }
+        """
+
+        // language=glsl
+        const val FRAGMENT_SHADER = """
+            precision mediump float;
+
+            uniform sampler2D texture;
+
+            varying vec2 texCoord;
+
+            void main() {
+                gl_FragColor = texture2D(texture, texCoord);
+            }
+        """
+    }
+}
+package com.seanghay.fadein.utils
+
+object BasicVertices {
+    val FULL_RECTANGLE = floatArrayOf(
+        -1.0f, -1.0f, 0.0f,
+        1.0f, -1.0f, 0.0f,
+        -1.0f, 1.0f, 0.0f,
+        1.0f, 1.0f, 0.0f
+    )
+
+    val NORMAL_TEXTURE_COORDINATES = floatArrayOf(
+        0.0f, 1.0f,
+        1.0f, 1.0f,
+        0.0f, 0.0f,
+        1.0f, 0.0f
+    )
+}
+
+package com.seanghay.fadein.utils
+
+import android.opengl.GLES20
+import android.util.Log
+
+data class ShaderData(val program: Int, val vertexShader: Int, val fragmentShader: Int)
+
+object GlUtils {
+
+    fun createProgramWithShaders(vertexSource: String, fragmentSource: String): ShaderData {
+        val vertex = loadShader(GLES20.GL_VERTEX_SHADER, vertexSource)
+        val fragment = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentSource)
+        val program = GLES20.glCreateProgram()
+        GLES20.glAttachShader(program, vertex)
+        GLES20.glAttachShader(program, fragment)
+        GLES20.glLinkProgram(program)
+
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        if (linkStatus[0] == 0) {
+            val msg = GLES20.glGetProgramInfoLog(program)
+            GLES20.glDeleteProgram(program)
+            throw RuntimeException("Could not link program: $msg")
+        }
+
+        return ShaderData(program, vertex, fragment)
+    }
+
+    private fun loadShader(type: Int, source: String): Int {
+        val shader = GLES20.glCreateShader(type)
+        GLES20.glShaderSource(shader, source)
+        GLES20.glCompileShader(shader)
+        val compiled = IntArray(1)
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+        if (compiled[0] == 0) {
+            val log = GLES20.glGetShaderInfoLog(shader)
+            GLES20.glDeleteShader(shader)
+            throw RuntimeException("Could not compile shader $type: $log")
+        }
+        return shader
+    }
+}
+
