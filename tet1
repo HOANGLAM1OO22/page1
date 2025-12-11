@@ -1,0 +1,153 @@
+Trước khi tiến hành, đây là danh sách các file / lớp tôi dự định copy (tất cả giữ package gốc để app và Mp4Composer không cần sửa):
+
+Core / orchestration
+com.seanghay.studio.core.Studio.kt
+com.seanghay.studio.core.StudioDrawable.kt
+com.seanghay.studio.gles.RenderContext.kt
+EGL / surface
+com.seanghay.studio.gles.egl.EglCore.kt
+com.seanghay.studio.gles.egl.EglSurfaceBase.kt
+com.seanghay.studio.gles.egl.EglExtensions.kt
+Shader / GL pipeline
+com.seanghay.studio.gles.shader.Shader.kt
+com.seanghay.studio.gles.shader.TextureShader.kt
+com.seanghay.studio.gles.shader.ImageTextureShader.kt
+com.seanghay.studio.gles.shader.AlphaOverlayTextureShader.kt
+Texture & uniforms
+com.seanghay.studio.gles.graphics.texture.Texture.kt
+com.seanghay.studio.gles.graphics.texture.Texture2d.kt
+com.seanghay.studio.gles.graphics.texture.TextureUniform.kt
+com.seanghay.studio.gles.graphics.texture.Texture2dUniform.kt
+com.seanghay.studio.gles.graphics.texture.BitmapTextureUniform.kt
+com.seanghay.studio.gles.graphics.InputValue.kt
+com.seanghay.studio.gles.graphics.uniform.Uniform.kt
+com.seanghay.studio.gles.graphics.uniform.FloatUniform.kt
+com.seanghay.studio.gles.graphics.uniform.BooleanUniform.kt
+com.seanghay.studio.gles.graphics.uniform.Mat4Uniform.kt
+(factory helpers like uniform1f / uniform1i)
+Graphics helpers
+com.seanghay.studio.gles.graphics.Matrix4f.kt (mat4)
+com.seanghay.studio.gles.graphics.attribute.VertexAttribute.kt
+com.seanghay.studio.utils.BasicVertices.kt
+com.seanghay.studio.utils.GlUtils.kt
+any small vec2 / uniform helper utilities referenced by shaders
+Ngoài ra tôi sẽ:
+
+Tạo module skeleton build.gradle (Android library) and fadein/src/main/AndroidManifest.xml.
+Thêm include ':fadein' vào settings.gradle.
+Cập nhật build.gradle để dùng implementation project(':fadein') thay cho project(':studio').
+Vì đây là một thay đổi tương đối lớn (nhiều file), tôi muốn xác nhận trước khi sao chép toàn bộ: bạn đồng ý tôi thực hiện toàn bộ các bước trên bây giờ (tạo module + copy các file liệt kê + cập nhật settings.gradle và build.gradle), hay bạn muốn tôi:
+
+chỉ tạo skeleton module trước, và dán 1–2 file mẫu để bạn kiểm tra; hoặc
+tôi tạo module nhưng thay đổi package (ví dụ com.seanghay.studiofadein) để tránh trùng tên?
+Gợi ý: tốt nhất là giữ nguyên package (com.seanghay.studio.*) để không phải sửa Mp4Composer và FadeInDrawable đã tạo. Nếu đồng ý, tôi sẽ bắt đầu và sau khoảng 3–5 file hoặc khi hoàn thành, báo tiến độ và bước tiếp theo. Bạn chọn "tiếp tục" để tôi bắt đầu sao chép.
+
+I'll mark the "Design new standalone module" todo as in-progress so the plan reflects we're preparing module usage guidance and test code. Expected outcome: todo list updated.
+
+Starting (5/6) Design new standalone module
+
+Dưới đây là một ví dụ đầy đủ về file androidTest (Kotlin) — nó minh hoạ chính xác cách test sẽ gọi module mới (các lớp Studio / StudioDrawable sẽ đến từ module :fadein mà bạn tạo), và vẫn dùng Mp4Composer trong module :app để encode MP4.
+
+Giải thích ngắn: test dùng ActivityTestRule để lấy một Activity (là LifecycleOwner) cho Studio.create(...). Test chờ callback onReady của Studio trước khi gọi Mp4Composer.create() và start(). Thời gian chờ CountDownLatch đảm bảo test không treo vô hạn.
+
+File test mẫu (đặt: app/src/androidTest/java/com/seanghay/studioexample/FadeInEncodeInstrumentedTest.kt)
+
+Nội dung (copy vào androidTest):
+package com.seanghay.studioexample
+
+import android.graphics.Bitmap
+import android.graphics.Color
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.rule.ActivityTestRule
+import com.seanghay.studio.core.Studio
+import com.seanghay.studioexample.transition.FadeInDrawable
+import com.seanghay.studioexample.transition.TransitionProperty
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+@RunWith(AndroidJUnit4::class)
+class FadeInEncodeInstrumentedTest {
+
+    @get:Rule
+    val activityRule = ActivityTestRule(MainActivity::class.java)
+
+    @Test
+    fun encodeTwoImages_withFadeInProducesMp4() {
+        val activity = activityRule.activity
+        // Create a Studio tied to the Activity lifecycle; onReady callback will be invoked when EGL is ready.
+        val readyLatch = CountDownLatch(1)
+        val studio = Studio.create(activity) {
+            // onReady callback invoked when EglCore is available
+            readyLatch.countDown()
+        }
+
+        // Wait up to 10s for EGL to be ready (increase if necessary)
+        val ready = readyLatch.await(10, TimeUnit.SECONDS)
+        assertTrue("Studio failed to initialize", ready)
+
+        // Create two sample bitmaps (simple colored images)
+        val width = 640
+        val height = 360
+        val bmp1 = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+            it.eraseColor(Color.RED)
+        }
+        val bmp2 = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+            it.eraseColor(Color.BLUE)
+        }
+
+        // Duration in ms for the clip
+        val durationMs = 2000L
+
+        // Compute delay fraction using your formula:
+        val delayFraction = if (durationMs > 150L) ((durationMs - 150f) / durationMs) else 1f
+        val transition = TransitionProperty(initAlpha = 0f, targetAlpha = 1f, delay = delayFraction)
+
+        // Create drawable from the fadein module (module exposes FadeInDrawable)
+        val drawable = FadeInDrawable(bmp1, bmp2, transition)
+
+        // Output path in app external files dir
+        val outFile = File(activity.getExternalFilesDir(null), "fadein_test.mp4")
+        if (outFile.exists()) outFile.delete()
+        val outPath = outFile.absolutePath
+
+        // Use Mp4Composer in app module to encode — pass onFinished to countDown when done
+        val finishedLatch = CountDownLatch(1)
+        val composer = Mp4Composer(studio, drawable, outPath, durationMs) {
+            finishedLatch.countDown()
+        }
+
+        // Encoder settings (optional tuning)
+        composer.width = width
+        composer.height = height
+        composer.frameRate = 30L
+        composer.bitrate = 4_000_000
+
+        // Create/start encoding on the GL thread
+        composer.create()
+        composer.start()
+
+        // Wait for encoding to finish; increase timeout if needed
+        val finished = finishedLatch.await(60, TimeUnit.SECONDS)
+        assertTrue("Encoding did not finish in time", finished)
+
+        // Validate output exists and is non-empty
+        assertTrue("Output file not found", outFile.exists() && outFile.length() > 500)
+    }
+}
+Những điểm lưu ý khi dùng module :fadein + Mp4Composer trong app
+
+Khi bạn di chuyển các lớp Studio / EGL / shader vào module :fadein, giữ package là com.seanghay.studio.* sẽ cho phép Mp4Composer (hiện nằm trong app) sử dụng chúng mà không chỉnh sửa import.
+Nếu thay đổi package, bạn cần cập nhật Mp4Composer hoặc import tương ứng trong mã test.
+Test trên emulator có thể thất bại nếu encoder H.264 phần cứng/driver không có hoặc không tương thích; thử trên thiết bị thật nếu gặp lỗi encoder.
+Nếu Studio.create(activity) không gọi onReady sớm trên môi trường của bạn, bạn có thể tăng thời gian chờ readyLatch.await(...).
+Tiếp theo tôi có thể:
+
+Tạo module skeleton :fadein ngay bây giờ (tạo folder, build.gradle, AndroidManifest.xml, và cập nhật settings.gradle), và dán lần lượt các file từ studio vào module (giữ các phần cần thiết).
+Hoặc chỉ tạo ví dụ test file trong repo (nếu bạn muốn kiểm tra ngay).
+Bạn muốn tôi tiếp tục và tạo module skeleton + copy một số file cốt lõi bây giờ?
+
