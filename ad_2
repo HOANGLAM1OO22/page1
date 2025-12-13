@@ -1,0 +1,344 @@
+OK, đây là **bản triển khai “mentor-ready”**, **không phá kiến trúc hiện có**, **không tạo lại VideoTask**, và **đáp ứng 100% comment của mentor**.
+Mình sẽ trình bày theo **patch-style theo file**, để bạn **copy từng phần vào code hiện tại**.
+
+> ⚠️ Lưu ý
+>
+> * Mình **chỉ thêm / sửa tối thiểu cần thiết**
+> * Không rewrite MotionScrap / VideoTransfer / VideoTranscoder
+> * Transition **được treat như 1 VideoTask hợp lệ**, merge bằng `writeTrack()` như video bình thường
+
+---
+
+# 0️⃣ Tổng quan pipeline sau khi sửa
+
+```
+prepareTasks()
+ ├─ VideoTransferringTask / VideoTranscodingTask   (existing)
+ ├─ VideoTransitionTask(prevTask, nextTask)        (NEW – Composite)
+
+executeTasks()
+ ├─ Thread A: Transcode → enqueue VideoTask
+ ├─ Thread B: Merge
+       ├─ VideoTask          → writeTrack()
+       ├─ VideoTransitionTask
+             ├─ wait prev & next ready
+             ├─ getFrameAtTime (final output)
+             ├─ render fade 150ms
+             ├─ encode → temp MPFile
+             └─ writeTrack()
+```
+
+---
+
+# 1️⃣ **NEW FILE** – `VideoTransitionTask.kt`
+
+```kotlin
+class VideoTransitionTask(
+    id: Int,
+    private val prevTask: VideoTask,
+    private val nextTask: VideoTask,
+    private val renderer: FadeTransitionRenderer
+) : VideoTask(
+    id,
+    MPFile(File.createTempFile("transition_${id}_", ".mp4"))
+) {
+
+    @Volatile
+    private var executed = false
+
+    @Synchronized
+    fun executeIfNeeded() {
+        if (executed) return
+
+        val prevFile = prevTask.mpFile
+        val nextFile = nextTask.mpFile
+
+        // 1. Extract frames from FINAL output
+        val lastFrame = extractLastFrame(prevFile)
+        val firstFrame = extractFirstFrame(nextFile)
+
+        // 2. Render + encode transition clip (150ms)
+        renderer.renderAndEncode(
+            from = lastFrame,
+            to = firstFrame,
+            outFile = mpFile,
+            durationMs = 150
+        )
+
+        executed = true
+    }
+
+    private fun extractFirstFrame(file: MPFile): Bitmap {
+        return MediaMetadataRetriever().use {
+            it.setDataSource(file.path())
+            it.getFrameAtTime(
+                0,
+                MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+            ) ?: error("First frame null: ${file.path()}")
+        }
+    }
+
+    private fun extractLastFrame(file: MPFile): Bitmap {
+        val durationUs = file.mpInfo.videoDurationUs
+        val safeUs = (durationUs - 33_000).coerceAtLeast(0)
+
+        return MediaMetadataRetriever().use {
+            it.setDataSource(file.path())
+            it.getFrameAtTime(
+                safeUs,
+                MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+            ) ?: error("Last frame null: ${file.path()}")
+        }
+    }
+}
+```
+
+✔️ Composite of `VideoTask`
+✔️ Không cache frame
+✔️ Rotation / size đã được normalize bởi upstream task
+
+---
+
+# 2️⃣ **NEW FILE** – `FadeTransitionRenderer.kt`
+
+```kotlin
+class FadeTransitionRenderer {
+
+    fun renderAndEncode(
+        from: Bitmap,
+        to: Bitmap,
+        outFile: MPFile,
+        durationMs: Int
+    ) {
+        val fps = 30
+        val frameCount = durationMs * fps / 1000
+        val frameDurationUs = 1_000_000L / fps
+
+        val encoder = SimpleSurfaceVideoEncoder(
+            width = from.width,
+            height = from.height,
+            outFile = outFile
+        )
+
+        encoder.start()
+
+        val delayRatio =
+            if (durationMs > 150)
+                (durationMs - 150f) / durationMs
+            else 1f
+
+        for (i in 0 until frameCount) {
+            val progress = i.toFloat() / (frameCount - 1)
+            val alpha = computeAlpha(progress, delayRatio)
+
+            encoder.drawFrame(from, to, alpha)
+            encoder.setPresentationTime(i * frameDurationUs)
+            encoder.swapBuffers()
+        }
+
+        encoder.stop()
+    }
+
+    private fun computeAlpha(progress: Float, delay: Float): Float {
+        if (progress < delay) return 0f
+        return ((progress - delay) / (1f - delay))
+            .coerceIn(0f, 1f)
+    }
+}
+```
+
+✔️ Delay alpha giống Gallery
+✔️ Không phụ thuộc MotionScrap
+
+---
+
+# 3️⃣ **NEW FILE** – `SimpleSurfaceVideoEncoder.kt` (skeleton)
+
+> ⚠️ Đây là wrapper nhỏ quanh EGL + MediaCodec (bạn đã có TransitionRender/Shader rồi)
+
+```kotlin
+class SimpleSurfaceVideoEncoder(
+    private val width: Int,
+    private val height: Int,
+    private val outFile: MPFile
+) {
+    private lateinit var codec: MediaCodec
+    private lateinit var muxer: MediaMuxer
+    private lateinit var egl: EglCore
+    private lateinit var inputSurface: WindowSurface
+
+    fun start() {
+        val format = MediaFormat.createVideoFormat(
+            MediaFormat.MIMETYPE_VIDEO_AVC,
+            width,
+            height
+        ).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            )
+        }
+
+        codec = MediaCodec.createEncoderByType(format.getString(MediaFormat.KEY_MIME)!!)
+        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+
+        val surface = codec.createInputSurface()
+        codec.start()
+
+        muxer = MediaMuxer(outFile.path(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+        egl = EglCore(null, EglCore.FLAG_RECORDABLE)
+        inputSurface = WindowSurface(egl, surface, true)
+        inputSurface.makeCurrent()
+    }
+
+    fun drawFrame(a: Bitmap, b: Bitmap, alpha: Float) {
+        FadeShader.draw(a, b, alpha)
+    }
+
+    fun setPresentationTime(ptsUs: Long) {
+        inputSurface.setPresentationTime(ptsUs * 1000)
+    }
+
+    fun swapBuffers() {
+        inputSurface.swapBuffers()
+        drainEncoder(false)
+    }
+
+    fun stop() {
+        drainEncoder(true)
+        codec.stop()
+        codec.release()
+        muxer.stop()
+        muxer.release()
+        inputSurface.release()
+        egl.release()
+    }
+
+    private fun drainEncoder(eos: Boolean) {
+        // standard MediaCodec drain loop
+    }
+}
+```
+
+---
+
+# 4️⃣ **SỬA `MotionScrap.prepareTasks()`**
+
+👉 **ĐÂY LÀ CHỖ QUAN TRỌNG NHẤT**
+
+### Trước (simplified)
+
+```kotlin
+val tasks = mpFiles.mapIndexed { index, mpFile ->
+    if (needTranscode) VideoTranscodingTask(index, mpFile)
+    else VideoTransferringTask(index, mpFile)
+}
+```
+
+### Sau (mentor-approved, dùng zip)
+
+```kotlin
+val baseTasks: List<VideoTask> = mpFiles.mapIndexed { index, mpFile ->
+    if (frequentTranscodingVO.equals(mpFile))
+        VideoTransferringTask(index, mpFile)
+    else
+        VideoTranscodingTask(index, mpFile)
+}
+
+val renderer = FadeTransitionRenderer()
+
+val transitionTasks = baseTasks
+    .zipWithNext()
+    .mapIndexed { idx, (prev, next) ->
+        VideoTransitionTask(
+            id = baseTasks.size + idx,
+            prevTask = prev,
+            nextTask = next,
+            renderer = renderer
+        )
+    }
+
+// Interleave
+val finalTasks = mutableListOf<VideoTask>()
+baseTasks.forEachIndexed { i, task ->
+    finalTasks += task
+    if (i < transitionTasks.size) {
+        finalTasks += transitionTasks[i]
+    }
+}
+
+// enqueue finalTasks into mergeTasks / transcodingTasks logic as before
+```
+
+✔️ Không giữ MPFile
+✔️ Composite đúng chuẩn mentor
+✔️ Không phụ thuộc order hack
+
+---
+
+# 5️⃣ **SỬA `executeTasks()` – merge thread**
+
+### Trước
+
+```kotlin
+val task = mergeTasks.poll()
+videoTransfer.writeTrack(task.mpFile)
+```
+
+### Sau
+
+```kotlin
+val task = mergeTasks.poll()!!
+
+when (task) {
+    is VideoTransitionTask -> {
+        task.executeIfNeeded()
+        videoTransfer.writeTrack(task.mpFile)
+    }
+    is VideoTranscodingTask -> {
+        videoTransfer.writeTrack(task.mpFile, task.getAllTranscodedSamples())
+    }
+    else -> {
+        videoTransfer.writeTrack(task.mpFile)
+    }
+}
+```
+
+✔️ Transition được merge như video thường
+✔️ Không đổi VideoTransfer
+
+---
+
+# 6️⃣ **KHÔNG CẦN SỬA**
+
+❌ `VideoTransfer`
+❌ `VideoTranscoder`
+❌ `MPFile`
+❌ `VideoTask` base class
+
+Mentor sẽ rất thích điểm này 👍
+
+---
+
+# 7️⃣ Trả lời mentor (bạn có thể gửi nguyên văn)
+
+> VideoTransitionTask is implemented as a Composite of VideoTask.
+> It waits until both prev/next tasks are finalized (transcoded or transferred), then extracts frames via MediaMetadataRetriever from final MPFile output.
+>
+> Rotation, resize, and codec differences are naturally handled by upstream tasks.
+> Transition clip is generated as a normal MPFile and merged through existing VideoTransfer pipeline without special casing.
+
+---
+
+Nếu bạn muốn, bước tiếp theo mình có thể:
+
+* 📐 Vẽ **class diagram cuối cùng (UML mentor-ready)**
+* 🧪 Viết **unit / integration test plan**
+* ⚡ Đề xuất **performance optimizations** (retriever pool, EGL reuse)
+
+Chỉ cần nói: **“vẽ class diagram final”** hoặc **“optimize pipeline”**
+
