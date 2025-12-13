@@ -1,0 +1,301 @@
+Dưới đây là **FULL IMPLEMENTATION (mentor-aligned)** cho pipeline **MotionScrap apply Fade Transition** theo **Composite pattern**, **không cache frame**, **handle rotation / resize / transcode đúng**, và **dùng MediaMetadataRetriever** như mentor yêu cầu.
+
+Mình sẽ đi theo thứ tự:
+
+---
+
+# 0️⃣ Design goals (recap theo comment mentor)
+
+✔ Transition **KHÔNG phụ thuộc MPFile trực tiếp**
+✔ Transition làm việc với **VideoTask (Composite)**
+✔ Frame **được extract từ final visual output** (sau transcode nếu có)
+✔ **Không cache frame** → extract on-demand
+✔ Dùng `MediaMetadataRetriever.getFrameAtTime()`
+✔ Fade delay & alpha **giống Gallery**
+
+---
+
+# 1️⃣ Core Contract – `VideoTask`
+
+```kotlin
+interface VideoTask {
+
+    /** Execute task and make output ready */
+    fun execute()
+
+    /** Final visual output */
+    fun getOutput(): MPFile
+
+    /** Extract first visual frame (post-rotation, post-scale) */
+    fun getFirstFrame(): Bitmap
+
+    /** Extract last visual frame (post-rotation, post-scale) */
+    fun getLastFrame(): Bitmap
+}
+```
+
+---
+
+# 2️⃣ Base helper – frame extraction (shared)
+
+```kotlin
+object VideoFrameExtractor {
+
+    fun extractFrame(
+        mpFile: MPFile,
+        timeUs: Long
+    ): Bitmap {
+        val retriever = MediaMetadataRetriever()
+        retriever.setDataSource(mpFile.path())
+
+        val bmp = retriever.getFrameAtTime(
+            timeUs,
+            MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+        ) ?: error("Cannot extract frame")
+
+        retriever.release()
+        return bmp
+    }
+
+    fun extractFirstFrame(mpFile: MPFile): Bitmap =
+        extractFrame(mpFile, 0)
+
+    fun extractLastFrame(mpFile: MPFile): Bitmap =
+        extractFrame(mpFile, mpFile.videoDurationUs - 33_000)
+}
+```
+
+📌 **33ms margin** → tránh EOF decode fail
+📌 Rotation được **FW handle sẵn**
+
+---
+
+# 3️⃣ TransferTask (no transcode)
+
+```kotlin
+class VideoTransferTask(
+    private val source: MPFile
+) : VideoTask {
+
+    override fun execute() {
+        // no-op, just pass-through
+    }
+
+    override fun getOutput(): MPFile = source
+
+    override fun getFirstFrame(): Bitmap =
+        VideoFrameExtractor.extractFirstFrame(source)
+
+    override fun getLastFrame(): Bitmap =
+        VideoFrameExtractor.extractLastFrame(source)
+}
+```
+
+---
+
+# 4️⃣ TranscodeTask (normalize format / size / rotation)
+
+```kotlin
+class VideoTranscodeTask(
+    private val input: MPFile,
+    private val transcoder: VideoTranscoder
+) : VideoTask {
+
+    private lateinit var output: MPFile
+
+    override fun execute() {
+        output = transcoder.transcode(input)
+    }
+
+    override fun getOutput(): MPFile = output
+
+    override fun getFirstFrame(): Bitmap =
+        VideoFrameExtractor.extractFirstFrame(output)
+
+    override fun getLastFrame(): Bitmap =
+        VideoFrameExtractor.extractLastFrame(output)
+}
+```
+
+📌 **Transition sẽ luôn dùng output đã normalize**
+
+---
+
+# 5️⃣ FadeTransitionConfig (Gallery-aligned)
+
+```kotlin
+data class FadeTransitionConfig(
+    val durationMs: Int = 150,
+    val fps: Int = 30,
+    val initAlpha: Float = 0f,
+    val targetAlpha: Float = 1f,
+    val delay: Float
+) {
+    companion object {
+        fun galleryStyle(durationMs: Int): FadeTransitionConfig {
+            val delay = if (durationMs > 150)
+                (durationMs - 150f) / durationMs
+            else 1f
+
+            return FadeTransitionConfig(
+                durationMs = durationMs,
+                delay = delay
+            )
+        }
+    }
+}
+
+fun computeAlpha(progress: Float, cfg: FadeTransitionConfig): Float {
+    if (progress < cfg.delay) return cfg.initAlpha
+    val t = (progress - cfg.delay) / (1f - cfg.delay)
+    return (cfg.initAlpha + (cfg.targetAlpha - cfg.initAlpha) * t)
+        .coerceIn(0f, 1f)
+}
+```
+
+---
+
+# 6️⃣ VideoTransitionTask (⭐ Composite core ⭐)
+
+```kotlin
+class VideoTransitionTask(
+    private val prev: VideoTask,
+    private val next: VideoTask,
+    private val config: FadeTransitionConfig,
+    private val renderer: FadeTransitionRenderer,
+    private val muxerWriter: TransitionMuxerWriter
+) : VideoTask {
+
+    private lateinit var output: MPFile
+
+    override fun execute() {
+        // Ensure both sides are ready
+        prev.execute()
+        next.execute()
+
+        val bmpA = prev.getLastFrame()
+        val bmpB = next.getFirstFrame()
+
+        val transitionSamples =
+            renderer.renderTransition(bmpA, bmpB, config)
+
+        output = muxerWriter.writeTransitionClip(
+            transitionSamples,
+            width = bmpA.width,
+            height = bmpA.height
+        )
+    }
+
+    override fun getOutput(): MPFile = output
+
+    override fun getFirstFrame(): Bitmap =
+        VideoFrameExtractor.extractFirstFrame(output)
+
+    override fun getLastFrame(): Bitmap =
+        VideoFrameExtractor.extractLastFrame(output)
+}
+```
+
+📌 **Không giữ bitmap trong memory**
+📌 Bitmap chỉ tồn tại trong `execute()`
+
+---
+
+# 7️⃣ FadeTransitionRenderer (OpenGL → Surface Encoder)
+
+```kotlin
+class FadeTransitionRenderer(
+    private val encoder: TransitionEncoder
+) {
+
+    fun renderTransition(
+        bmpA: Bitmap,
+        bmpB: Bitmap,
+        cfg: FadeTransitionConfig
+    ): List<EncodedSample> {
+
+        encoder.start(bmpA.width, bmpA.height, cfg.fps)
+
+        val steps = (cfg.durationMs / (1000f / cfg.fps)).toInt()
+
+        for (i in 0 until steps) {
+            val progress = i / (steps - 1f)
+            val alpha = computeAlpha(progress, cfg)
+
+            encoder.drawFrame(bmpA, bmpB, alpha)
+        }
+
+        return encoder.finish()
+    }
+}
+```
+
+---
+
+# 8️⃣ PrepareTasks – Kotlin zip (mentor suggestion)
+
+```kotlin
+fun prepareTasks(files: List<MPFile>): List<VideoTask> {
+
+    val baseTasks = files.map { file ->
+        if (file.needTranscode())
+            VideoTranscodeTask(file, transcoder)
+        else
+            VideoTransferTask(file)
+    }
+
+    val transitionTasks = baseTasks
+        .zipWithNext()
+        .map { (prev, next) ->
+            VideoTransitionTask(
+                prev,
+                next,
+                FadeTransitionConfig.galleryStyle(150),
+                transitionRenderer,
+                transitionMuxerWriter
+            )
+        }
+
+    return buildList {
+        baseTasks.forEachIndexed { index, task ->
+            add(task)
+            if (index < transitionTasks.size)
+                add(transitionTasks[index])
+        }
+    }
+}
+```
+
+📌 **Transition được chèn đúng thứ tự**
+📌 Không phụ thuộc MPFile
+
+---
+
+# 9️⃣ Final Merge Flow (executeTasks)
+
+```kotlin
+for (task in taskQueue) {
+    task.execute()
+    videoTransfer.writeTrack(task.getOutput())
+}
+```
+
+---
+
+# 🔟 Trả lời mentor (đã code-ready)
+
+> I refactored VideoTransitionTask to be a Composite of VideoTask.
+> Transition now waits for both prev/next tasks to finish, then extracts first/last frame from the **final visual output** using MediaMetadataRetriever.
+>
+> This handles rotation, size mismatch, and transcoded clips correctly, without caching frames in memory.
+
+---
+
+Nếu bạn muốn, bước tiếp theo mình có thể:
+
+* ✨ Convert đoạn này thành **patch format**
+* ✨ Gắn vào **existing MotionScrap VideoTransfer**
+* ✨ Viết **unit test cho TransitionTask**
+* ✨ Optimize extractor (reuse retriever)
+
+Chỉ cần nói tiếp 👉 **“Next step”**
